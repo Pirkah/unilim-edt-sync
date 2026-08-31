@@ -1,0 +1,4 @@
+playwright>=1.40.0
+python-dotenv>=1.0.0
+pytz>=2023.3
+icalendar>=5.0.0
