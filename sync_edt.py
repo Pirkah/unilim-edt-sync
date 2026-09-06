@@ -115,8 +115,8 @@ def insert_events_by_category(events: list, chunk_size: int = 20) -> int:
     return total_success
 
 
-async def scrape_unilim_edt(num_weeks: int = 2) -> list:
-    """Récupère l'emploi du temps depuis ADE Campus via Playwright."""
+async def scrape_unilim_edt(num_weeks: int = 3) -> list:
+    """Récupère l'emploi du temps depuis ADE Campus via Playwright (par défaut 3 semaines glissantes)."""
     print(f"[*] Démarrage du scraping Playwright pour {CAS_USERNAME} (horizon: {num_weeks} semaines, groupe: {TARGET_GROUP})...")
     
     all_extracted_events = []
@@ -177,38 +177,28 @@ async def scrape_unilim_edt(num_weeks: int = 2) -> list:
         
         print("[+] Cours chargés dans le planning!")
         
-        # 3. Récupération des 2 semaines cibles (semaine actuelle + semaine suivante)
-        target_weeks = await page.evaluate('''() => {
-            const allWeekBtns = Array.from(document.querySelectorAll('.x-btn-text')).filter(b => {
-                const t = b.innerText || '';
-                return t.startsWith('S') && t.includes(' du ');
-            });
-            
-            let activeIdx = allWeekBtns.findIndex(b => {
-                const parent = b.closest('.x-btn, table, td');
-                return parent && (parent.className.includes('pressed') || parent.className.includes('active') || parent.className.includes('focus'));
-            });
-            
-            if (activeIdx === -1) {
-                activeIdx = allWeekBtns.findIndex(b => b.innerText.includes('31 août') || b.innerText.includes('S36'));
-            }
-            if (activeIdx === -1) activeIdx = 0;
-            
-            return allWeekBtns.slice(activeIdx, activeIdx + 2).map(b => b.innerText.trim());
-        }''')
+        # 3. Récupération des semaines cibles selon la date actuelle (3 semaines glissantes : courante + 2 suivantes)
+        now = datetime.now()
+        current_iso_week = now.isocalendar()[1]
+        target_week_codes = [f"S{current_iso_week + i}" for i in range(num_weeks)]
+        print(f"[+] Semaines cibles calculées ({num_weeks} semaines glissantes) : {target_week_codes}")
         
-        print(f"[+] Semaines cibles détectées : {target_weeks}")
-        
-        # 4. Extraction des cours pour chacune des 2 semaines
-        for week_idx, w_label in enumerate(target_weeks):
-            print(f"[*] Analyse de la semaine {week_idx + 1}/{len(target_weeks)} : {w_label}...")
+        # 4. Extraction des cours pour chaque semaine cible
+        for week_idx, w_code in enumerate(target_week_codes):
+            print(f"[*] Analyse de la semaine {week_idx + 1}/{len(target_week_codes)} ({w_code})...")
             
-            if week_idx > 0:
-                w_code = w_label.split(' ')[0]
+            # Trouver et cliquer sur le bouton de la semaine
+            target_btn = page.locator('.x-btn-text').filter(has_text=re.compile(rf'^{w_code}\b')).first
+            if await target_btn.count() > 0:
                 print(f"    -> Basculement vers {w_code}...")
-                target_btn = page.locator('.x-btn-text').filter(has_text=w_code).first
-                if await target_btn.count() > 0:
-                    await target_btn.click()
+                await target_btn.click()
+                await page.wait_for_timeout(2500)
+            else:
+                # Si le bouton n'est pas directement visible, chercher dans les boutons de semaine
+                print(f"    -> Recherche du bouton {w_code}...")
+                alt_btn = page.locator('.x-btn-text').filter(has_text=w_code).first
+                if await alt_btn.count() > 0:
+                    await alt_btn.click()
                     await page.wait_for_timeout(2500)
             
             cards = await page.evaluate('''() => {
@@ -374,8 +364,8 @@ def sync():
     print(f"☁️  Calendriers iCloud : CM | TD | TP")
     print("=" * 60)
     
-    # 1. Récupérer les événements via Playwright (2 prochaines semaines)
-    events = asyncio.run(scrape_unilim_edt(num_weeks=2))
+    # 1. Récupérer les événements via Playwright (3 semaines glissantes : ~21 jours pour couvrir 14+ jours)
+    events = asyncio.run(scrape_unilim_edt(num_weeks=3))
     
     if not events:
         print("[!] Aucun événement récupéré. Vérifiez les identifiants ou l'accès réseau.")
@@ -385,14 +375,16 @@ def sync():
     ics_path = BASE_DIR / "unilim_edt.ics"
     generate_ics_file(events, ics_path)
     
-    # 3. Nettoyage de la plage et injection dans les 3 calendriers iCloud
-    earliest_dt = min(e["start_dt"] for e in events)
+    # 3. Nettoyage ciblé : Uniquement à partir d'AUJOURD'HUI pour préserver les anciens jours
+    today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     latest_dt = max(e["end_dt"] for e in events)
-    print(f"[*] Nettoyage de la plage du {earliest_dt.strftime('%d/%m')} au {latest_dt.strftime('%d/%m')} dans CM, TD, TP...")
-    clean_target_range_events(earliest_dt, latest_dt)
+    print(f"[*] Nettoyage des événements futurs (du {today_start.strftime('%d/%m')} au {latest_dt.strftime('%d/%m')}, anciens jours préservés)...")
+    clean_target_range_events(today_start, latest_dt)
     
-    success_count = insert_events_by_category(events, chunk_size=20)
-    print(f"✅ SYNCHRONISATION RÉUSSIE : {success_count}/{len(events)} cours injectés dans les calendriers iCloud CM, TD, TP !")
+    # 4. Injecter les événements futurs / en cours
+    future_events = [e for e in events if e["end_dt"] >= today_start]
+    success_count = insert_events_by_category(future_events, chunk_size=20)
+    print(f"✅ SYNCHRONISATION RÉUSSIE : {success_count}/{len(future_events)} cours futurs injectés dans CM, TD, TP (anciens cours conservés) !")
 
 
 if __name__ == "__main__":
