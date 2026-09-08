@@ -356,13 +356,29 @@ def generate_ics_file(events: list, output_path: Path) -> None:
     print(f"[+] Fichier ICS exporté avec succès : {output_path} ({len(events)} événements)")
 
 
-def send_macos_notification(title: str, subtitle: str, message: str, sound: str = "Glass") -> None:
-    """Envoie une notification native macOS avec son."""
+def send_apple_notifications(title: str, subtitle: str, message: str, sound: str = "Glass") -> None:
+    """Envoie une notification locale sur Mac + une notification Push sur iPhone via Rappels iCloud."""
     t = title.replace('"', '\\"')
     s = subtitle.replace('"', '\\"')
     m = message.replace('"', '\\"')
-    scpt = f'display notification "{m}" with title "{t}" subtitle "{s}" sound name "{sound}"'
-    subprocess.run(["osascript", "-e", scpt], capture_output=True, text=True)
+    
+    # 1. Bannière de notification sur Mac
+    scpt_mac = f'display notification "{m}" with title "{t}" subtitle "{s}" sound name "{sound}"'
+    subprocess.run(["osascript", "-e", scpt_mac], capture_output=True, text=True)
+    
+    # 2. Push sur iPhone via Rappels Apple (liste dédiée 'Unilim EDT' synchronisée iCloud)
+    scpt_iphone = f'''
+    tell application "Reminders"
+        if not (exists (first list whose name is "Unilim EDT")) then
+            make new list with properties {{name:"Unilim EDT"}}
+        end if
+        tell list "Unilim EDT"
+            delete every reminder
+            make new reminder with properties {{name:"{t} : {s}", body:"{m}", due date:(current date)}}
+        end tell
+    end tell
+    '''
+    subprocess.run(["osascript", "-e", scpt_iphone], capture_output=True, text=True)
 
 
 def sync():
@@ -378,7 +394,7 @@ def sync():
     
     if not events:
         print("[!] Aucun événement récupéré. Vérifiez les identifiants ou l'accès réseau.")
-        send_macos_notification(
+        send_apple_notifications(
             title="Unilim EDT Sync ⚠️",
             subtitle="Mise à jour impossible",
             message="Vérifiez votre connexion ou relancez la validation 2FA (login.py)."
@@ -400,8 +416,8 @@ def sync():
     success_count = insert_events_by_category(future_events, chunk_size=20)
     print(f"✅ SYNCHRONISATION RÉUSSIE : {success_count}/{len(future_events)} cours futurs injectés dans CM, TD, TP (anciens cours conservés) !")
     
-    # 5. Notification macOS native automatique
-    send_macos_notification(
+    # 5. Notifications automatiques Mac + iPhone (iCloud)
+    send_apple_notifications(
         title="Unilim EDT Sync 🎓",
         subtitle="Emploi du temps à jour ✅",
         message=f"{success_count} cours synchronisés sur iCloud ({TARGET_GROUP})."
