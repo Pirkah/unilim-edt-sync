@@ -356,6 +356,15 @@ def generate_ics_file(events: list, output_path: Path) -> None:
     print(f"[+] Fichier ICS exporté avec succès : {output_path} ({len(events)} événements)")
 
 
+def send_macos_notification(title: str, subtitle: str, message: str, sound: str = "Glass") -> None:
+    """Envoie une notification native macOS avec son."""
+    t = title.replace('"', '\\"')
+    s = subtitle.replace('"', '\\"')
+    m = message.replace('"', '\\"')
+    scpt = f'display notification "{m}" with title "{t}" subtitle "{s}" sound name "{sound}"'
+    subprocess.run(["osascript", "-e", scpt], capture_output=True, text=True)
+
+
 def sync():
     """Point d'entrée principal de la synchronisation."""
     print("=" * 60)
@@ -369,6 +378,11 @@ def sync():
     
     if not events:
         print("[!] Aucun événement récupéré. Vérifiez les identifiants ou l'accès réseau.")
+        send_macos_notification(
+            title="Unilim EDT Sync ⚠️",
+            subtitle="Mise à jour impossible",
+            message="Vérifiez votre connexion ou relancez la validation 2FA (login.py)."
+        )
         return
         
     # 2. Sauvegarder le fichier .ics local
@@ -385,6 +399,13 @@ def sync():
     future_events = [e for e in events if e["end_dt"] >= today_start]
     success_count = insert_events_by_category(future_events, chunk_size=20)
     print(f"✅ SYNCHRONISATION RÉUSSIE : {success_count}/{len(future_events)} cours futurs injectés dans CM, TD, TP (anciens cours conservés) !")
+    
+    # 5. Notification macOS native automatique
+    send_macos_notification(
+        title="Unilim EDT Sync 🎓",
+        subtitle="Emploi du temps à jour ✅",
+        message=f"{success_count} cours synchronisés sur iCloud ({TARGET_GROUP})."
+    )
 
 
 if __name__ == "__main__":
