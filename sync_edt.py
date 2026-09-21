@@ -4,6 +4,7 @@ Unilim EDT Sync - Synchronisation automatique de l'emploi du temps vers Apple Ca
 Supporte :
 1. Community IUT (Moodle - Section Emploi du temps & dossiers de semaines)
 2. ADE Campus (planning.unilim.fr)
+3. Aiguillage automatique en 4 calendriers : CM, TD, TP, et Évaluations / Contrôles
 Auteur: Julien Nicolle
 """
 
@@ -28,22 +29,38 @@ CAS_PASSWORD = os.getenv("CAS_PASSWORD", os.getenv("UNILIM_PASSWORD", ""))
 TARGET_GROUP = os.getenv("TARGET_GROUP", "GEMA1 TP2")
 TZ = pytz.timezone("Europe/Paris")
 
-# Calendriers cibles sur iCloud
-ICLOUD_CALENDARS = {
-    "CM": "CM",
-    "TD": "TD",
-    "TP": "TP"
-}
+
+def get_icloud_calendars() -> dict:
+    """Détecte dynamiquement les noms des calendriers iCloud cibles (CM, TD, TP, et Contrôles/Évaluation)."""
+    cals = {
+        "CM": "CM",
+        "TD": "TD",
+        "TP": "TP",
+        "EVAL": "Controles"
+    }
+    try:
+        scpt = 'tell application "Calendar" to get name of every calendar'
+        res = subprocess.run(["osascript", "-e", scpt], capture_output=True, text=True)
+        if res.returncode == 0:
+            names = [n.strip() for n in res.stdout.split(",")]
+            for possible in ["Controles", "Contrôles", "Evaluation", "Évaluation", "Evaluations", "Évaluations"]:
+                if possible in names:
+                    cals["EVAL"] = possible
+                    break
+    except Exception:
+        pass
+    return cals
 
 
 def clean_target_range_events(start_dt: datetime, end_dt: datetime) -> None:
-    """Nettoie la plage glissante sur les calendriers iCloud CM, TD, TP (préserve les anciens jours)."""
+    """Nettoie la plage glissante sur les calendriers iCloud CM, TD, TP et Contrôles (préserve les anciens jours)."""
     subprocess.run(["open", "-a", "Calendar"])
     s_str = start_dt.strftime("%d/%m/%Y 00:00:00")
     e_str = (end_dt + timedelta(days=1)).strftime("%d/%m/%Y 23:59:59")
     
+    icloud_cals = get_icloud_calendars()
     lines = []
-    for c_name in ICLOUD_CALENDARS.values():
+    for c_name in icloud_cals.values():
         lines.append(f'''
         if (exists (first calendar whose name is "{c_name}")) then
             tell calendar "{c_name}"
@@ -62,32 +79,60 @@ def clean_target_range_events(start_dt: datetime, end_dt: datetime) -> None:
     subprocess.run(["osascript", "-e", scpt], capture_output=True, text=True)
 
 
-def get_event_category(title: str, description: str) -> str:
-    """Détermine la catégorie (CM, TD ou TP) pour l'aiguillage dans le bon calendrier iCloud."""
-    t = (title + " " + description).upper()
-    if re.search(r'\bTP\d*\b', title.upper()) or "TP GEMA" in description.upper() or "PPP (TP" in title.upper():
+def get_event_category(title: str, description: str = "", raw_text: str = "", is_yellow: bool = False) -> str:
+    """
+    Détermine la catégorie (EVAL, CM, TD ou TP) pour l'aiguillage dans le bon calendrier iCloud.
+    Priorité maximale accordée aux évaluations, contrôles et DS (fond jaune sur ADE ou mention dans le texte/PDF).
+    """
+    # 1. Fond jaune sur ADE Campus -> 100% Évaluation / Contrôle
+    if is_yellow:
+        return "EVAL"
+        
+    full_text = f"{title} {description} {raw_text}"
+    
+    # Exclure le terme pédagogique "Contrôle de gestion"
+    check_text = re.sub(r'contr[oô]le\s+de\s+gestion', '', full_text, flags=re.I)
+    
+    # 2. Détection des Évaluations / Contrôles / DS / Examens
+    eval_patterns = [
+        r'\bCONTROLE\b', r'\bCONTRÔLE\b', r'\bEVALUATION\b', r'\bÉVALUATION\b',
+        r'\bEVAL\b', r'\bEXAMEN\b', r'\bPARTIEL\b', r'\bDS\b', r'\bDS\d+\b',
+        r'\bDEVOIR\s+SURVEILL[EÉ]\b', r'\bINTERROGATION\b', r'\bTEST\b', r'\bQCM\b'
+    ]
+    if any(re.search(p, check_text, re.I) for p in eval_patterns):
+        return "EVAL"
+        
+    # 3. Détection du type de cours (CM, TD, TP)
+    # Nettoyer les mentions de groupe comme 'GEMA1-TP1', 'GEMA1-TP2' pour ne pas fausser la détection
+    clean_text = re.sub(r'GEMA\d?[-_ ]?TP\d?', '', title, flags=re.I)
+    
+    if re.search(r'\bTP\b|\(TP\d*\)', clean_text, re.I):
         return "TP"
-    if re.search(r'\bCM\d*\b', title.upper()) or "CM BUT" in description.upper() or "RÉUNION DE RENTRÉE" in t:
+    if re.search(r'\bCM\b|\(CM\d*\)', clean_text, re.I):
         return "CM"
+    if re.search(r'\bTD\b|\(TD\d*\)', clean_text, re.I):
+        return "TD"
+        
     return "TD"
 
 
 def insert_events_by_category(events: list, chunk_size: int = 20) -> int:
-    """Insère les cours dans les calendriers iCloud CM, TD et TP."""
+    """Insère les cours dans les calendriers iCloud CM, TD, TP et Contrôles."""
     subprocess.run(["open", "-a", "Calendar"])
     total_success = 0
+    icloud_cals = get_icloud_calendars()
     
     # Regrouper par catégorie
-    categorized = {"CM": [], "TD": [], "TP": []}
+    categorized = {"CM": [], "TD": [], "TP": [], "EVAL": []}
     for ev in events:
-        cat = ev.get("category") or get_event_category(ev["title"], ev["description"])
+        cat = ev.get("category") or get_event_category(ev["title"], ev.get("description", ""))
         categorized[cat].append(ev)
         
     for cat, cat_events in categorized.items():
         if not cat_events:
             continue
             
-        c_name = ICLOUD_CALENDARS[cat]
+        c_name = icloud_cals.get(cat, "TD")
         print(f"[*] Injection dans '{c_name}' (iCloud) : {len(cat_events)} cours...")
         
         for i in range(0, len(cat_events), chunk_size):
@@ -237,15 +282,13 @@ async def fetch_community_iut_events(context) -> list:
                     group_match = re.search(r'Groupe\(s\):\s*([^\n]+)', raw_desc)
                     groups = group_match.group(1).strip() if group_match else ''
                     
-                    course_type = "TD"
-                    if " TP" in raw_summary or "TP" in code:
-                        course_type = "TP"
-                    elif " CM" in raw_summary or "CM" in code:
-                        course_type = "CM"
-                        
-                    title = f"{code} {course_type}"
+                    # Déterminer la catégorie (EVAL, TP, CM ou TD)
+                    course_type = get_event_category(raw_summary, raw_desc, f"{code} {teacher}")
+                    suffix = "Contrôle" if course_type == "EVAL" else course_type
+                    title = f"{code} {suffix}"
+                    
                     location = f"Salle {raw_loc} - IUT Limoges" if raw_loc and not raw_loc.startswith("Salle") else (raw_loc or "IUT Limoges")
-                    desc = f"Cours: {code}\nType: {course_type}\nEnseignant: {teacher}\nGroupes: {groups}\nLieu: {location}"
+                    desc = f"Cours: {code}\nType: {suffix}\nEnseignant: {teacher}\nGroupes: {groups}\nLieu: {location}"
                     
                     events.append({
                         "title": title,
@@ -338,7 +381,7 @@ async def scrape_ade_campus_events(context, num_weeks: int = 3) -> list:
                 for (const d of allDivs) {
                     const t = d.innerText || '';
                     const rect = d.getBoundingClientRect();
-                    if (rect.left > 200 && rect.width > 50 && rect.height > 25 && t.includes('h') && (t.includes('CM') || t.includes('TD') || t.includes('TP') || t.includes('AUTONOMIE') || t.includes('SAE') || t.includes('R3.') || t.includes('Réunion') || t.includes('REUNION') || t.includes('Contrôle'))) {
+                    if (rect.left > 200 && rect.width > 50 && rect.height > 25 && t.includes('h') && (t.includes('CM') || t.includes('TD') || t.includes('TP') || t.includes('AUTONOMIE') || t.includes('SAE') || t.includes('R3.') || t.includes('Réunion') || t.includes('REUNION') || t.includes('Contrôle') || t.includes('Evaluation') || t.includes('DS'))) {
                         const hasMatchingChild = Array.from(d.querySelectorAll('div')).some(child => {
                             const ct = child.innerText || '';
                             return ct.includes('h') && (ct.includes('CM') || ct.includes('TD') || ct.includes('TP') || ct.includes('AUTONOMIE') || ct.includes('SAE') || ct.includes('R3.'));
@@ -346,9 +389,12 @@ async def scrape_ade_campus_events(context, num_weeks: int = 3) -> list:
                         if (!hasMatchingChild) {
                             const cx = (rect.left + rect.right) / 2;
                             const day = days.find(dayObj => cx >= dayObj.left && cx <= dayObj.right);
+                            const bg = window.getComputedStyle(d).backgroundColor || '';
+                            const isYellow = bg.includes('255, 255') || bg.includes('255, 235') || bg.includes('255, 240') || bg.includes('yellow');
                             matches.push({
                                 text: t.trim(),
-                                day: day ? day.text : null
+                                day: day ? day.text : null,
+                                isYellow: isYellow
                             });
                         }
                     }
@@ -419,13 +465,14 @@ async def scrape_ade_campus_events(context, num_weeks: int = 3) -> list:
                         is_for_user = False
                     
                 if is_for_user:
+                    cat = get_event_category(title, description, card["text"], is_yellow=card.get("isYellow", False))
                     all_extracted_events.append({
                         "title": title,
                         "start_dt": start_dt,
                         "end_dt": end_dt,
                         "location": location,
                         "description": description,
-                        "category": get_event_category(title, description),
+                        "category": cat,
                         "teacher": teacher
                     })
     except Exception as e:
@@ -461,12 +508,10 @@ def merge_events_with_priority(community_events: list, ade_events: list) -> list
             # Chevauchement temporel : (StartA < EndB) et (EndA > StartB)
             if (ade_start < com_end) and (ade_end > com_start):
                 conflict = True
-                print(f"    [-] Conflit évité : '{ade_ev['title']}' sur ADE ignoré car '{com_ev['title']}' est présent dans les fichiers à {com_start.strftime('%d/%m %H:%M')}")
                 ignored_ade_count += 1
                 break
                 
         if not conflict:
-            # Vérifier si un cours identique n'est pas déjà présent
             if not any(e["title"] == ade_ev["title"] and e["start_dt"] == ade_ev["start_dt"] for e in final_events):
                 final_events.append(ade_ev)
                 added_ade_count += 1
@@ -563,7 +608,7 @@ def sync():
     print("=" * 60)
     print(f"🚀 SYNCHRONISATION EDT UNILIM -> APPLE CALENDAR iCLOUD ({datetime.now().strftime('%d/%m/%Y %H:%M:%S')})")
     print(f"👤 Étudiant : {CAS_USERNAME} | Groupe : {TARGET_GROUP}")
-    print(f"☁️  Calendriers iCloud : CM | TD | TP")
+    print(f"☁️  Calendriers iCloud : CM | TD | TP | Contrôles")
     print("=" * 60)
     
     # 1. Récupérer les événements depuis toutes les sources (Community IUT + ADE Campus)
@@ -588,10 +633,10 @@ def sync():
     print(f"[*] Nettoyage des événements futurs (du {today_start.strftime('%d/%m')} au {latest_dt.strftime('%d/%m')}, anciens jours préservés)...")
     clean_target_range_events(today_start, latest_dt)
     
-    # 4. Injecter les événements futurs / en cours dans les calendriers iCloud CM, TD, TP
+    # 4. Injecter les événements futurs / en cours dans les 4 calendriers iCloud
     future_events = [e for e in events if e["end_dt"] >= today_start]
     success_count = insert_events_by_category(future_events, chunk_size=20)
-    print(f"✅ SYNCHRONISATION RÉUSSIE : {success_count}/{len(future_events)} cours futurs injectés dans CM, TD, TP (anciens cours conservés) !")
+    print(f"✅ SYNCHRONISATION RÉUSSIE : {success_count}/{len(future_events)} cours futurs injectés dans CM, TD, TP, Contrôles (anciens cours conservés) !")
     
     # 5. Notifications automatiques Mac + iPhone (iCloud)
     send_apple_notifications(
