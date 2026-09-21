@@ -435,13 +435,55 @@ async def scrape_ade_campus_events(context, num_weeks: int = 3) -> list:
     return all_extracted_events
 
 
+def merge_events_with_priority(community_events: list, ade_events: list) -> list:
+    """
+    Fusionne les événements en donnant la priorité absolue aux fichiers de Community IUT.
+    Si un créneau horaire chevauche un cours des fichiers, le cours ADE est automatiquement ignoré.
+    """
+    print(f"\n[*] --- Fusion intelligente avec priorité aux fichiers de Community IUT ---")
+    print(f"    -> Cours issus des fichiers (Community IUT) : {len(community_events)}")
+    print(f"    -> Cours issus d'ADE Campus : {len(ade_events)}")
+    
+    final_events = list(community_events)
+    ignored_ade_count = 0
+    added_ade_count = 0
+    
+    for ade_ev in ade_events:
+        ade_start = ade_ev["start_dt"]
+        ade_end = ade_ev["end_dt"]
+        
+        # 1. Vérifier si un cours Community IUT chevauche ce créneau horaire
+        conflict = False
+        for com_ev in community_events:
+            com_start = com_ev["start_dt"]
+            com_end = com_ev["end_dt"]
+            
+            # Chevauchement temporel : (StartA < EndB) et (EndA > StartB)
+            if (ade_start < com_end) and (ade_end > com_start):
+                conflict = True
+                print(f"    [-] Conflit évité : '{ade_ev['title']}' sur ADE ignoré car '{com_ev['title']}' est présent dans les fichiers à {com_start.strftime('%d/%m %H:%M')}")
+                ignored_ade_count += 1
+                break
+                
+        if not conflict:
+            # Vérifier si un cours identique n'est pas déjà présent
+            if not any(e["title"] == ade_ev["title"] and e["start_dt"] == ade_ev["start_dt"] for e in final_events):
+                final_events.append(ade_ev)
+                added_ade_count += 1
+                
+    final_events.sort(key=lambda x: x["start_dt"])
+    print(f"[+] Résultat de la fusion : {len(final_events)} cours retenus ({len(community_events)} fichiers + {added_ade_count} ADE uniques, {ignored_ade_count} doublons ADE ignorés)")
+    return final_events
+
+
 async def scrape_all_sources() -> list:
-    """Récupère l'emploi du temps depuis Community IUT et ADE Campus, avec fusion intelligente."""
+    """Récupère l'emploi du temps depuis Community IUT et ADE Campus, avec priorité absolue aux fichiers."""
     profile_dir = BASE_DIR / ".browser_profile"
     profile_dir.mkdir(exist_ok=True)
     auth_file = BASE_DIR / "auth_state.json"
     
-    all_events = []
+    community_events = []
+    ade_events = []
     
     async with async_playwright() as p:
         context = await p.chromium.launch_persistent_context(
@@ -450,31 +492,18 @@ async def scrape_all_sources() -> list:
             viewport={"width": 1400, "height": 900}
         )
         
-        # 1. Récupération prioritaire sur Community IUT (source actuelle active)
+        # 1. Récupération prioritaire sur Community IUT (fichiers hebdomadaires)
         community_events = await fetch_community_iut_events(context)
-        all_events.extend(community_events)
         
-        # 2. Récupération complémentaire sur ADE Campus (si disponible)
+        # 2. Récupération complémentaire sur ADE Campus (fallback si besoin)
         ade_events = await scrape_ade_campus_events(context, num_weeks=3)
-        all_events.extend(ade_events)
         
         # Sauvegarder la session active
         await context.storage_state(path=str(auth_file))
         await context.close()
         
-    # Déduplication stricte par clé unique (titre, date début, date fin)
-    unique_events = []
-    seen = set()
-    for ev in all_events:
-        key = (ev["title"], ev["start_dt"], ev["end_dt"])
-        if key not in seen:
-            seen.add(key)
-            unique_events.append(ev)
-            
-    # Tri chronologique
-    unique_events.sort(key=lambda x: x["start_dt"])
-    print(f"\n[+] Total global de cours uniques filtrés ({TARGET_GROUP}) : {len(unique_events)}")
-    return unique_events
+    # Fusion avec priorité aux fichiers de Community IUT
+    return merge_events_with_priority(community_events, ade_events)
 
 
 def generate_ics_file(events: list, output_path: Path) -> None:
