@@ -149,12 +149,21 @@ async def fetch_community_iut_events(context) -> list:
         await page.goto(course_url, wait_until="networkidle")
         await page.wait_for_timeout(2000)
         
-        # 3. Récupérer tous les dossiers de semaines
+        # 3. Récupérer tous les dossiers de semaines (ex: 'Semaine 39', 'S40', 'S41', etc.)
         folders = await page.evaluate('''() => {
-            const links = Array.from(document.querySelectorAll('.activity.folder a, a.aalmodal, a[href*="mod/folder/view.php"]')).map(a => ({
+            const links = Array.from(document.querySelectorAll('a[href*="mod/folder/view.php"]')).map(a => ({
                 title: a.innerText.trim(),
                 href: a.href
-            })).filter(f => f.title.toLowerCase().includes('semaine') && f.href.includes('mod/folder'));
+            })).filter(f => {
+                const t = f.title.toLowerCase();
+                return f.href.includes('mod/folder') && (
+                    t.includes('semaine') || 
+                    t.includes('sem') || 
+                    /^s\d+/i.test(t) || 
+                    /\b\d{1,2}\b/.test(t) ||
+                    t.includes('dossier')
+                );
+            });
             
             const unique = [];
             const seen = new Set();
