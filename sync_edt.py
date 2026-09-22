@@ -85,19 +85,18 @@ def load_courses_dictionary() -> dict:
 COURSES_DICTIONARY = load_courses_dictionary()
 
 
-def resolve_course_title(raw_code: str, course_type: str) -> str:
+def resolve_course_title(raw_code: str, course_type: str, teacher: str = "") -> str:
     """
-    Associe le code matière (ex: R3.06, R3.GEMA.13, SAE3.01) à son nom officiel issu de signatures.unilim.fr.
-    Ne confond jamais les salles (ex: R04, R01, 103) avec un code matière.
+    Associe le code matière (ex: R3.06, R3.GEMA.13, SAE3.01) à son nom officiel issu de signatures.unilim.fr
+    et ajoute le nom de l'enseignant de manière claire et lisible.
     """
     clean_code = raw_code.strip()
     
     # 1. Si le titre contient déjà un nom explicite (ex: 'TC R3.04 Fiscalité (CM01)')
-    if any(m in clean_code.lower() for m in ["fiscalit", "gestion", "juridique", "finance", "communication", "anglais", "business model", "droit", "numérique"]):
-        return clean_code
-        
+    # On nettoie d'éventuels suffixes de groupe redondants
+    clean_code = re.sub(r'\s*\([A-Z0-9]+\)\s*$', '', clean_code).strip()
+    
     # 2. Extraire le code canonique (ex: R3.06, R3.GEMA.13 -> R3.13, SAE3.01 -> SAE3.01)
-    # Attention: R\d{2} seul (ex: R04) est une salle, pas un code matière (qui a toujours un point R3. ou R4.)
     m = re.search(r'(R[34]\.(?:GEMA\.|GCFF\.|GPRH\.)?(\d{2}))|(SAE\s*3\.?\d*)', clean_code, re.I)
     
     name = ""
@@ -114,11 +113,16 @@ def resolve_course_title(raw_code: str, course_type: str) -> str:
             
     suffix = "Contrôle" if course_type == "EVAL" else f"({course_type})"
     
-    if name:
-        # Formater proprement: ex 'R3.06 Contrôle de gestion (TD)'
-        return f"{clean_code} {name} {suffix}"
+    # Construction du titre de base
+    if name and name.lower() not in clean_code.lower():
+        base_title = f"{clean_code} {name} {suffix}"
     else:
-        return f"{clean_code} {suffix}"
+        base_title = f"{clean_code} {suffix}"
+        
+    # Ajouter le nom de l'enseignant de façon bien visible
+    if teacher and teacher.strip() and teacher.strip().lower() not in base_title.lower():
+        return f"{base_title} - {teacher.strip()}"
+    return base_title
 
 
 def get_icloud_calendars() -> dict:
@@ -376,8 +380,8 @@ async def fetch_community_iut_events(context) -> list:
                     # Déterminer la catégorie (EVAL, TP, CM ou TD)
                     course_type = get_event_category(raw_summary, raw_desc, f"{raw_code} {teacher}")
                     
-                    # Résoudre le nom complet de la matière via le référentiel signatures.unilim.fr
-                    title = resolve_course_title(raw_code, course_type)
+                    # Résoudre le nom complet de la matière via le référentiel signatures.unilim.fr et ajouter le prof
+                    title = resolve_course_title(raw_code, course_type, teacher)
                     
                     location = f"Salle {raw_loc} - IUT Limoges" if raw_loc and not raw_loc.startswith("Salle") else (raw_loc or "IUT Limoges")
                     desc = f"Cours: {title}\nType: {course_type}\nEnseignant: {teacher}\nGroupes: {groups}\nLieu: {location}"
@@ -558,7 +562,7 @@ async def scrape_ade_campus_events(context, num_weeks: int = 3) -> list:
                     
                 if is_for_user:
                     cat = get_event_category(title, description, card["text"], is_yellow=card.get("isYellow", False))
-                    resolved_title = resolve_course_title(title, cat)
+                    resolved_title = resolve_course_title(title, cat, teacher)
                     all_extracted_events.append({
                         "title": resolved_title,
                         "start_dt": start_dt,
