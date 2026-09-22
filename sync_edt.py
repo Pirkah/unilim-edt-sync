@@ -4,13 +4,15 @@ Unilim EDT Sync - Synchronisation automatique de l'emploi du temps vers Apple Ca
 Supporte :
 1. Community IUT (Moodle - Section Emploi du temps & dossiers de semaines)
 2. ADE Campus (planning.unilim.fr)
-3. Aiguillage automatique en 4 calendriers : CM, TD, TP, et Évaluations / Contrôles
+3. Résolution automatique des codes matières (R3.06 -> Contrôle de gestion, etc.) via Signatures Unilim
+4. Aiguillage automatique en 4 calendriers : CM, TD, TP, et Contrôles / Évaluations
 Auteur: Julien Nicolle
 """
 
 import os
 import re
 import sys
+import json
 import asyncio
 import subprocess
 from datetime import datetime, date, timedelta
@@ -28,6 +30,95 @@ CAS_USERNAME = os.getenv("CAS_USERNAME", os.getenv("UNILIM_USERNAME", "Nicolle12
 CAS_PASSWORD = os.getenv("CAS_PASSWORD", os.getenv("UNILIM_PASSWORD", ""))
 TARGET_GROUP = os.getenv("TARGET_GROUP", "GEMA1 TP2")
 TZ = pytz.timezone("Europe/Paris")
+
+# Dictionnaire de secours officiel BUT GEA (S3 & S4)
+DEFAULT_COURSES_MAP = {
+    "R3.01": "Environnement économique",
+    "R3.02": "Environnement juridique",
+    "R3.03": "Management d'activités",
+    "R3.04": "Fiscalité",
+    "R3.05": "Traitement numérique des données",
+    "R3.06": "Contrôle de gestion",
+    "R3.07": "Finance",
+    "R3.08": "Expression et communication",
+    "R3.09": "Anglais des affaires",
+    "R3.10": "PPP",
+    "R3.11": "Droit et entrepreneuriat",
+    "R3.12": "Financement des activités",
+    "R3.13": "Management opérationnel",
+    "R3.14": "Business Model",
+    "R3.15": "LV2 Espagnol",
+    "SAE3.01": "Création d'organisation",
+    "SAE3.02": "Business Model",
+    "SAE 3.1": "Création d'organisation",
+    "SAE 3.2": "Business Model",
+    "R4.01": "Environnement économique international",
+    "R4.02": "Environnement juridique",
+    "R4.03": "Management d'activités",
+    "R4.04": "Traitement numérique des données",
+    "R4.05": "Expression et communication",
+    "R4.06": "Anglais des affaires",
+    "R4.07": "PPP",
+    "R4.08": "Business plan",
+    "R4.09": "Marketing opérationnel",
+    "R4.10": "Management opérationnel approfondi",
+    "R4.11": "LV2 Espagnol",
+    "SAE 4.1": "Création ou développement d'organisation",
+    "SAE 4.2": "Business Plan"
+}
+
+
+def load_courses_dictionary() -> dict:
+    """Charge le dictionnaire des matières depuis le cache local ou le dictionnaire par défaut."""
+    cache_file = BASE_DIR / "signatures_courses.json"
+    mapping = dict(DEFAULT_COURSES_MAP)
+    if cache_file.exists():
+        try:
+            with open(cache_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                mapping.update(data)
+        except Exception:
+            pass
+    return mapping
+
+
+COURSES_DICTIONARY = load_courses_dictionary()
+
+
+def resolve_course_title(raw_code: str, course_type: str) -> str:
+    """
+    Associe le code matière (ex: R3.06, R3.GEMA.13, SAE3.01) à son nom officiel issu de signatures.unilim.fr.
+    Ne confond jamais les salles (ex: R04, R01, 103) avec un code matière.
+    """
+    clean_code = raw_code.strip()
+    
+    # 1. Si le titre contient déjà un nom explicite (ex: 'TC R3.04 Fiscalité (CM01)')
+    if any(m in clean_code.lower() for m in ["fiscalit", "gestion", "juridique", "finance", "communication", "anglais", "business model", "droit", "numérique"]):
+        return clean_code
+        
+    # 2. Extraire le code canonique (ex: R3.06, R3.GEMA.13 -> R3.13, SAE3.01 -> SAE3.01)
+    # Attention: R\d{2} seul (ex: R04) est une salle, pas un code matière (qui a toujours un point R3. ou R4.)
+    m = re.search(r'(R[34]\.(?:GEMA\.|GCFF\.|GPRH\.)?(\d{2}))|(SAE\s*3\.?\d*)', clean_code, re.I)
+    
+    name = ""
+    if m:
+        if m.group(1):
+            full_r, num = m.group(1), m.group(2)
+            prefix = full_r[:2] # R3 ou R4
+            norm_key = f"{prefix}.{num}"
+            name = COURSES_DICTIONARY.get(norm_key, "")
+        elif m.group(3):
+            sae_str = m.group(3).upper().replace(" ", "")
+            norm_key = "SAE3.01" if "3.1" in sae_str or "3.01" in sae_str else "SAE3.02"
+            name = COURSES_DICTIONARY.get(norm_key, "")
+            
+    suffix = "Contrôle" if course_type == "EVAL" else f"({course_type})"
+    
+    if name:
+        # Formater proprement: ex 'R3.06 Contrôle de gestion (TD)'
+        return f"{clean_code} {name} {suffix}"
+    else:
+        return f"{clean_code} {suffix}"
 
 
 def get_icloud_calendars() -> dict:
@@ -163,7 +254,7 @@ def insert_events_by_category(events: list, chunk_size: int = 20) -> int:
 
 
 async def fetch_community_iut_events(context) -> list:
-    """Récupère les cours publiés sur Community IUT (Moodle GEA)."""
+    """Récupère les cours publiés sur Community IUT (Moodle GEA) avec enrichissement des noms de matières."""
     print(f"\n[*] --- Connexion à Community IUT (Moodle GEA) pour {TARGET_GROUP} ---")
     page = context.pages[0] if context.pages else await context.new_page()
     download_dir = BASE_DIR / "downloaded_edt"
@@ -274,7 +365,7 @@ async def fetch_community_iut_events(context) -> list:
                         end_dt = end_dt.replace(tzinfo=None)
                         
                     code_match = re.search(r'Code:\s*([^\n]+)', raw_desc)
-                    code = code_match.group(1).strip() if code_match else raw_summary.split(' ')[0]
+                    raw_code = code_match.group(1).strip() if code_match else raw_summary.split(' ')[0]
                     
                     teacher_match = re.search(r'Enseignant\(s\):\s*([^\n]+)', raw_desc)
                     teacher = teacher_match.group(1).strip() if teacher_match else ''
@@ -283,12 +374,13 @@ async def fetch_community_iut_events(context) -> list:
                     groups = group_match.group(1).strip() if group_match else ''
                     
                     # Déterminer la catégorie (EVAL, TP, CM ou TD)
-                    course_type = get_event_category(raw_summary, raw_desc, f"{code} {teacher}")
-                    suffix = "Contrôle" if course_type == "EVAL" else course_type
-                    title = f"{code} {suffix}"
+                    course_type = get_event_category(raw_summary, raw_desc, f"{raw_code} {teacher}")
+                    
+                    # Résoudre le nom complet de la matière via le référentiel signatures.unilim.fr
+                    title = resolve_course_title(raw_code, course_type)
                     
                     location = f"Salle {raw_loc} - IUT Limoges" if raw_loc and not raw_loc.startswith("Salle") else (raw_loc or "IUT Limoges")
-                    desc = f"Cours: {code}\nType: {suffix}\nEnseignant: {teacher}\nGroupes: {groups}\nLieu: {location}"
+                    desc = f"Cours: {title}\nType: {course_type}\nEnseignant: {teacher}\nGroupes: {groups}\nLieu: {location}"
                     
                     events.append({
                         "title": title,
@@ -466,8 +558,9 @@ async def scrape_ade_campus_events(context, num_weeks: int = 3) -> list:
                     
                 if is_for_user:
                     cat = get_event_category(title, description, card["text"], is_yellow=card.get("isYellow", False))
+                    resolved_title = resolve_course_title(title, cat)
                     all_extracted_events.append({
-                        "title": title,
+                        "title": resolved_title,
                         "start_dt": start_dt,
                         "end_dt": end_dt,
                         "location": location,
