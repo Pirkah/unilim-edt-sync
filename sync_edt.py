@@ -2,10 +2,11 @@
 """
 Unilim EDT Sync - Synchronisation automatique de l'emploi du temps vers Apple Calendar (iCloud)
 Supporte :
-1. Community IUT (Moodle - Section Emploi du temps & dossiers de semaines)
+1. Community IUT (Moodle - Section Emploi du temps & dossiers de semaines avec parsing hybride ICS & PDF)
 2. ADE Campus (planning.unilim.fr)
 3. Résolution automatique des codes matières (R3.06 -> Contrôle de gestion, etc.) via Signatures Unilim
 4. Aiguillage automatique en 4 calendriers : CM, TD, TP, et Contrôles / Évaluations
+5. Affichage clair du nom de l'enseignant dans le titre de l'événement
 Auteur: Julien Nicolle
 """
 
@@ -19,6 +20,7 @@ from datetime import datetime, date, timedelta
 from pathlib import Path
 from dotenv import load_dotenv
 import pytz
+import pdfplumber
 from icalendar import Calendar, Event, vText
 from playwright.async_api import async_playwright
 
@@ -93,7 +95,6 @@ def resolve_course_title(raw_code: str, course_type: str, teacher: str = "") -> 
     clean_code = raw_code.strip()
     
     # 1. Si le titre contient déjà un nom explicite (ex: 'TC R3.04 Fiscalité (CM01)')
-    # On nettoie d'éventuels suffixes de groupe redondants
     clean_code = re.sub(r'\s*\([A-Z0-9]+\)\s*$', '', clean_code).strip()
     
     # 2. Extraire le code canonique (ex: R3.06, R3.GEMA.13 -> R3.13, SAE3.01 -> SAE3.01)
@@ -103,7 +104,7 @@ def resolve_course_title(raw_code: str, course_type: str, teacher: str = "") -> 
     if m:
         if m.group(1):
             full_r, num = m.group(1), m.group(2)
-            prefix = full_r[:2] # R3 ou R4
+            prefix = full_r[:2]
             norm_key = f"{prefix}.{num}"
             name = COURSES_DICTIONARY.get(norm_key, "")
         elif m.group(3):
@@ -179,16 +180,13 @@ def get_event_category(title: str, description: str = "", raw_text: str = "", is
     Détermine la catégorie (EVAL, CM, TD ou TP) pour l'aiguillage dans le bon calendrier iCloud.
     Priorité maximale accordée aux évaluations, contrôles et DS (fond jaune sur ADE ou mention dans le texte/PDF).
     """
-    # 1. Fond jaune sur ADE Campus -> 100% Évaluation / Contrôle
     if is_yellow:
         return "EVAL"
         
     full_text = f"{title} {description} {raw_text}"
-    
-    # Exclure le terme pédagogique "Contrôle de gestion"
     check_text = re.sub(r'contr[oô]le\s+de\s+gestion', '', full_text, flags=re.I)
     
-    # 2. Détection des Évaluations / Contrôles / DS / Examens
+    # 1. Détection des Évaluations / Contrôles / DS / Examens
     eval_patterns = [
         r'\bCONTROLE\b', r'\bCONTRÔLE\b', r'\bEVALUATION\b', r'\bÉVALUATION\b',
         r'\bEVAL\b', r'\bEXAMEN\b', r'\bPARTIEL\b', r'\bDS\b', r'\bDS\d+\b',
@@ -197,8 +195,7 @@ def get_event_category(title: str, description: str = "", raw_text: str = "", is
     if any(re.search(p, check_text, re.I) for p in eval_patterns):
         return "EVAL"
         
-    # 3. Détection du type de cours (CM, TD, TP)
-    # Nettoyer les mentions de groupe comme 'GEMA1-TP1', 'GEMA1-TP2' pour ne pas fausser la détection
+    # 2. Détection du type de cours (CM, TD, TP)
     clean_text = re.sub(r'GEMA\d?[-_ ]?TP\d?', '', title, flags=re.I)
     
     if re.search(r'\bTP\b|\(TP\d*\)', clean_text, re.I):
@@ -217,7 +214,6 @@ def insert_events_by_category(events: list, chunk_size: int = 20) -> int:
     total_success = 0
     icloud_cals = get_icloud_calendars()
     
-    # Regrouper par catégorie
     categorized = {"CM": [], "TD": [], "TP": [], "EVAL": []}
     for ev in events:
         cat = ev.get("category") or get_event_category(ev["title"], ev.get("description", ""))
@@ -257,8 +253,90 @@ def insert_events_by_category(events: list, chunk_size: int = 20) -> int:
     return total_success
 
 
+def parse_pdf_timetable(pdf_path: Path, week_num: int, year: int = None) -> list:
+    """Extrait les cours directement depuis la grille PDF hebdomadaire de l'IUT."""
+    if year is None:
+        year = datetime.now().year
+        
+    # Calcul du lundi de la semaine ISO
+    jan4 = date(year, 1, 4)
+    start_of_year = jan4 - timedelta(days=jan4.isoweekday() - 1)
+    monday = start_of_year + timedelta(weeks=week_num - 1)
+    
+    events = []
+    
+    with pdfplumber.open(str(pdf_path)) as pdf:
+        p = pdf.pages[0]
+        course_rects = [r for r in p.rects if r["width"] < 700 and r["height"] > 20]
+        
+        for r in course_rects:
+            # 1. Jour de la semaine (X axis)
+            cx = (r["x0"] + r["x1"]) / 2
+            day_idx = int((cx - 56.0) / 126.9)
+            if day_idx < 0 or day_idx > 5:
+                continue
+            event_date = monday + timedelta(days=day_idx)
+            
+            # 2. Heures de début et fin (Y axis)
+            start_hour_float = 7.0 + (r["top"] - 60.0) / 36.52
+            end_hour_float = 7.0 + (r["bottom"] - 60.0) / 36.52
+            
+            start_h = int(start_hour_float)
+            start_m = int(round((start_hour_float - start_h) * 60 / 5) * 5)
+            if start_m == 60:
+                start_h += 1
+                start_m = 0
+                
+            end_h = int(end_hour_float)
+            end_m = int(round((end_hour_float - end_h) * 60 / 5) * 5)
+            if end_m == 60:
+                end_h += 1
+                end_m = 0
+                
+            start_dt = datetime(event_date.year, event_date.month, event_date.day, start_h, start_m)
+            end_dt = datetime(event_date.year, event_date.month, event_date.day, end_h, end_m)
+            
+            # 3. Extraction du texte
+            cropped = p.crop((r["x0"], r["top"], r["x1"], r["bottom"]))
+            text = cropped.extract_text() or ""
+            lines = [l.strip() for l in text.split("\n") if l.strip()]
+            if not lines:
+                continue
+                
+            raw_code_line = lines[0]
+            
+            # Enseignant, salle, groupes
+            teacher = ""
+            location = "IUT Limoges"
+            groups = []
+            
+            for l in lines[1:]:
+                if re.match(r'^(Amphi\s+[A-Z0-9]+|\d{3}|R\.\d{2}|R\d{2})$', l, re.I):
+                    location = f"Salle {l} - IUT Limoges"
+                elif any(g in l for g in ["GEMA", "TP", "TD", "CM"]):
+                    groups.append(l)
+                elif not any(char.isdigit() for char in l) and len(l) > 3 and not any(k in l.lower() for k in ["gestion", "finance", "droit", "economie", "anglais", "espagnol", "developpement", "numerique", "business"]):
+                    teacher = l
+                    
+            cat = get_event_category(raw_code_line, text, raw_code_line)
+            title = resolve_course_title(raw_code_line, cat, teacher)
+            desc = f"Cours: {title}\nType: {cat}\nEnseignant: {teacher}\nGroupes: {', '.join(set(groups))}\nLieu: {location}"
+            
+            events.append({
+                "title": title,
+                "start_dt": start_dt,
+                "end_dt": end_dt,
+                "location": location,
+                "description": desc,
+                "category": cat,
+                "teacher": teacher
+            })
+            
+    return events
+
+
 async def fetch_community_iut_events(context) -> list:
-    """Récupère les cours publiés sur Community IUT (Moodle GEA) avec enrichissement des noms de matières."""
+    """Récupère les cours publiés sur Community IUT (Moodle GEA) en inspectant tous les dossiers disponibles."""
     print(f"\n[*] --- Connexion à Community IUT (Moodle GEA) pour {TARGET_GROUP} ---")
     page = context.pages[0] if context.pages else await context.new_page()
     download_dir = BASE_DIR / "downloaded_edt"
@@ -289,7 +367,7 @@ async def fetch_community_iut_events(context) -> list:
         await page.goto(course_url, wait_until="networkidle")
         await page.wait_for_timeout(2000)
         
-        # 3. Récupérer tous les dossiers de semaines (ex: 'Semaine 39', 'S40', 'S41', etc.)
+        # 3. Récupérer tous les dossiers de semaines (ex: 'Semaine 39', 'Semaine 40', 'Semaine 41', 'S42', etc.)
         folders = await page.evaluate('''() => {
             const links = Array.from(document.querySelectorAll('a[href*="mod/folder/view.php"]')).map(a => ({
                 title: a.innerText.trim(),
@@ -316,11 +394,35 @@ async def fetch_community_iut_events(context) -> list:
             return unique;
         }''')
         
-        print(f"[+] Dossiers de semaines détectés sur Community IUT : {[f['title'].splitlines()[0] for f in folders]}")
-        
+        # Extraire le numéro de semaine de chaque dossier
+        parsed_folders = []
         for f in folders:
-            folder_title = f['title'].splitlines()[0].strip()
-            folder_url = f['href']
+            title = f['title'].splitlines()[0].strip()
+            num_match = re.search(r'(?:semaine|sem|s|\b)(\d{1,2})\b', title, re.I)
+            week_num = int(num_match.group(1)) if num_match else 0
+            parsed_folders.append({
+                "title": title,
+                "href": f["href"],
+                "week_num": week_num
+            })
+            
+        print(f"[+] Dossiers de semaines détectés sur Community IUT : {[f['title'] for f in parsed_folders]}")
+        
+        # Filtrer pour ne traiter que les semaines pertinentes (semaine courante et futures)
+        now = datetime.now()
+        current_iso_week = now.isocalendar()[1]
+        
+        # Traiter les dossiers disponibles à date
+        for f in parsed_folders:
+            folder_title = f["title"]
+            folder_url = f["href"]
+            week_num = f["week_num"] or current_iso_week
+            
+            # Si le dossier est trop ancien (ex: 2 semaines dans le passé), on peut le sauter
+            if week_num < current_iso_week - 1 and week_num > 0:
+                print(f"[*] Dossier {folder_title} ignoré (semaine passée).")
+                continue
+                
             print(f"[*] Analyse de {folder_title} ({folder_url})...")
             await page.goto(folder_url, wait_until="networkidle")
             await page.wait_for_timeout(1500)
@@ -332,25 +434,29 @@ async def fetch_community_iut_events(context) -> list:
                 })).filter(l => l.href.includes('pluginfile.php') || l.text.includes('.ics') || l.text.includes('.pdf'));
             }''')
             
-            # Rechercher le fichier ICS correspondant à notre groupe
-            target_file = None
+            # 1. Chercher un fichier ICS pour le groupe
+            target_ics = None
+            target_pdf = None
+            
             for file_info in files:
                 fn_norm = re.sub(r'[^A-Z0-9]', '', file_info['text'].upper())
                 fn_href = file_info['href'].upper()
-                if group_norm in fn_norm and ('.ICS' in fn_norm or '.ICS' in fn_href):
-                    target_file = file_info
-                    break
-                    
-            if target_file:
-                print(f"    -> Téléchargement de {target_file['text']}...")
+                if group_norm in fn_norm or group_norm in re.sub(r'[^A-Z0-9]', '', fn_href):
+                    if '.ICS' in fn_norm or '.ICS' in fn_href:
+                        target_ics = file_info
+                    elif '.PDF' in fn_norm or '.PDF' in fn_href:
+                        target_pdf = file_info
+                        
+            # Si un ICS existe, on le privilégie
+            if target_ics:
+                print(f"    -> Téléchargement du fichier ICS : {target_ics['text']}...")
                 async with page.expect_download() as download_info:
-                    await page.locator(f'a:has-text("{target_file["text"]}")').first.click()
+                    await page.locator(f'a:has-text("{target_ics["text"]}")').first.click()
                 download = await download_info.value
                 save_file = download_dir / f"{folder_title.replace(' ', '_')}_{download.suggested_filename}"
                 await download.save_as(save_file)
                 print(f"    [+] Fichier sauvegardé : {save_file}")
                 
-                # Parser et corriger le fichier ICS
                 with open(save_file, "rb") as fp:
                     cal = Calendar.from_ical(fp.read())
                     
@@ -363,7 +469,7 @@ async def fetch_community_iut_events(context) -> list:
                     end_dt = ev.get("dtend").dt
                     if isinstance(start_dt, datetime):
                         start_dt = TZ.localize(start_dt) if start_dt.tzinfo is None else start_dt.astimezone(TZ)
-                        start_dt = start_dt.replace(tzinfo=None) # Stocker en heure locale naïve pour AppleScript
+                        start_dt = start_dt.replace(tzinfo=None)
                     if isinstance(end_dt, datetime):
                         end_dt = TZ.localize(end_dt) if end_dt.tzinfo is None else end_dt.astimezone(TZ)
                         end_dt = end_dt.replace(tzinfo=None)
@@ -377,10 +483,7 @@ async def fetch_community_iut_events(context) -> list:
                     group_match = re.search(r'Groupe\(s\):\s*([^\n]+)', raw_desc)
                     groups = group_match.group(1).strip() if group_match else ''
                     
-                    # Déterminer la catégorie (EVAL, TP, CM ou TD)
                     course_type = get_event_category(raw_summary, raw_desc, f"{raw_code} {teacher}")
-                    
-                    # Résoudre le nom complet de la matière via le référentiel signatures.unilim.fr et ajouter le prof
                     title = resolve_course_title(raw_code, course_type, teacher)
                     
                     location = f"Salle {raw_loc} - IUT Limoges" if raw_loc and not raw_loc.startswith("Salle") else (raw_loc or "IUT Limoges")
@@ -395,8 +498,22 @@ async def fetch_community_iut_events(context) -> list:
                         "category": course_type,
                         "teacher": teacher
                     })
+            # Si seul le PDF est disponible (ex: Semaine 41)
+            elif target_pdf:
+                print(f"    -> Téléchargement du fichier PDF : {target_pdf['text']}...")
+                async with page.expect_download() as download_info:
+                    await page.locator(f'a:has-text("{target_pdf["text"]}")').first.click()
+                download = await download_info.value
+                save_file = download_dir / f"{folder_title.replace(' ', '_')}_{download.suggested_filename}"
+                await download.save_as(save_file)
+                print(f"    [+] Fichier sauvegardé : {save_file}")
+                
+                # Parsing géométrique du PDF
+                pdf_events = parse_pdf_timetable(save_file, week_num=week_num, year=now.year)
+                print(f"    [+] {len(pdf_events)} cours extraits du PDF pour {folder_title}")
+                events.extend(pdf_events)
             else:
-                print(f"    [!] Aucun fichier ICS trouvé pour {TARGET_GROUP} dans {folder_title}")
+                print(f"    [!] Aucun fichier ICS ou PDF trouvé pour {TARGET_GROUP} dans {folder_title}")
                 
     except Exception as e:
         print(f"[!] Erreur lors de la récupération Community IUT : {e}")
@@ -634,7 +751,7 @@ async def scrape_all_sources() -> list:
             viewport={"width": 1400, "height": 900}
         )
         
-        # 1. Récupération prioritaire sur Community IUT (fichiers hebdomadaires)
+        # 1. Récupération prioritaire sur Community IUT (fichiers hebdomadaires ICS et PDF)
         community_events = await fetch_community_iut_events(context)
         
         # 2. Récupération complémentaire sur ADE Campus (fallback si besoin)

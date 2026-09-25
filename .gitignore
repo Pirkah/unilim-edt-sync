@@ -50,4 +50,6 @@ wheels/
 *.ics
 temp/
 logs/
+downloaded_edt/
 *.log
+
