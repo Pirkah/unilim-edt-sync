@@ -631,24 +631,35 @@ async def scrape_ade_campus_events(context, num_weeks: int = 3) -> list:
             await page.wait_for_load_state("networkidle")
             await page.wait_for_timeout(3000)
             
-        async def click_node(name):
+        async def click_node(name, check_child=None):
+            # Si un enfant est déjà visible, pas besoin de double-cliquer
+            if check_child:
+                child_loc = page.get_by_text(check_child, exact=True).first
+                if await child_loc.is_visible():
+                    return
+                    
             loc = page.get_by_text(name, exact=False).first
             await loc.scroll_into_view_if_needed()
             await loc.dblclick()
             await page.wait_for_timeout(1500)
             
         print("[*] Navigation vers Semestre 3 GEA GEMA...")
-        await click_node("Groupes Etudiants")
-        await click_node("I. U. T. du Limousin")
-        await click_node("BACHELOR UNIVERSITAIRE DE TECHNOLOGIE")
+        await click_node("Groupes Etudiants", check_child="I. U. T. du Limousin")
+        await click_node("I. U. T. du Limousin", check_child="BACHELOR UNIVERSITAIRE DE TECHNOLOGIE")
+        await click_node("BACHELOR UNIVERSITAIRE DE TECHNOLOGIE", check_child="BUT 2 - GEA LIMOGES - GEMA")
         
         tree_scroller = page.locator(".x-grid3-scroller").first
-        await tree_scroller.evaluate("el => el.scrollTop = 350")
+        if await tree_scroller.count() > 0:
+            await tree_scroller.evaluate("el => el.scrollTop = 350")
         await page.wait_for_timeout(1000)
         
-        await click_node("BUT 2 - GEA LIMOGES - GEMA")
+        await click_node("BUT 2 - GEA LIMOGES - GEMA", check_child="Semestre 3")
         await page.wait_for_timeout(1000)
-        await click_node("Semestre 3")
+        
+        # Le dernier clic sur Semestre 3 affiche l'EDT
+        loc_s3 = page.get_by_text("Semestre 3", exact=True).first
+        await loc_s3.scroll_into_view_if_needed()
+        await loc_s3.click()  # Un simple clic suffit pour afficher le planning
         await page.wait_for_timeout(3000)
         
         now = datetime.now()
