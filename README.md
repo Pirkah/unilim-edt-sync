@@ -6,10 +6,10 @@ Synchronisation automatique, intelligente et haute précision de l'emploi du tem
 
 ## ✨ Fonctionnalités & Nouveautés
 
-### 🌐 API EDTTS Native (Aucun VPN, Aucun Moodle)
-- **Accès direct & Ultra-rapide** : Le script se connecte directement à la nouvelle plateforme des emplois du temps (`mmi.unilim.fr/edtts`), récupérant le fichier ICS original généré par l'IUT.
-- 🔓 **Sans VPN / Sans Connexion IUT** : Plus besoin d'être connecté au réseau de l'IUT ni d'utiliser le client VPN. Ça fonctionne de n'importe où, instantanément.
-- 🚀 **Sans Playwright** : Fini l'ouverture d'un navigateur en arrière-plan, la synchronisation prend littéralement moins de 2 secondes.
+### 🌐 Double Source Hybride & Priorité aux Fichiers Hebdomadaires
+- **Community IUT (Moodle GEA)** : Détection et téléchargement automatique des plannings publiés par dossiers hebdomadaires (`Semaine 39`, `S40`, `S41`...).
+- **ADE Campus (`planning.unilim.fr`)** : Consultation complémentaire en tâche de fond et fallback automatique.
+- 🛡️ **Anti-doublons & Résolution de conflits** : Priorité absolue accordée aux fichiers hebdomadaires de Community IUT. Si un cours est présent dans les fichiers sur un créneau horaire, tout cours obsolète d'ADE Campus à la même heure est automatiquement ignoré.
 
 ### 📚 Résolution Automatique des Intitulés de Matières (`signatures.unilim.fr`)
 - Traduction instantanée des codes bruts (`R3.06`, `R3.GEMA.13`, `SAE3.01`, etc.) en véritables intitulés officiels issus du portail de notes :
@@ -49,6 +49,7 @@ Aiguillage automatique des cours dans 4 calendriers iCloud dédiés :
 git clone https://github.com/Pirkah/unilim-edt-sync.git
 cd unilim-edt-sync
 pip3 install -r requirements.txt
+playwright install chromium
 ```
 
 ### 2. Configuration des identifiants (`.env`)
@@ -63,7 +64,14 @@ UNILIM_PASSWORD="votre_mot_de_passe"
 TARGET_GROUP="GEMA1 TP2"
 ```
 
-### 3. Lancer la synchronisation manuelle
+### 3. Première connexion (Sauvegarde de session A2F)
+Lancez l'assistant graphique pour valider le code A2F reçu par mail :
+```bash
+python3 login.py
+```
+*(Une fenêtre s'ouvre, validez votre connexion et les cookies de session sont enregistrés).*
+
+### 4. Lancer la synchronisation manuelle
 ```bash
 python3 sync_edt.py
 # ou
@@ -79,8 +87,9 @@ python3 sync_edt.py
 
 ## 📂 Structure du projet
 
-- `sync_edt.py` : Moteur principal (requête API EDTTS, résolution de matières, injection iCloud et notifications)..
+- `sync_edt.py` : Moteur principal (scraping hybride Community IUT + ADE, résolution de matières, fusion intelligente, injection iCloud et notifications).
 - `signatures_courses.json` : Référentiel des correspondances codes matières ➔ intitulés officiels.
+- `login.py` : Assistant graphique de connexion CAS et mémorisation de session A2F.
 - `install_agent.sh` : Script de déploiement et d'activation du daemon `launchd` macOS.
 - `Mettre_a_jour_EDT.command` : Raccourci exécutable par double-clic sur le Bureau.
 - `requirements.txt` : Dépendances Python (`playwright`, `icalendar`, `pypdf`, etc.).
