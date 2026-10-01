@@ -14,6 +14,7 @@ import os
 import re
 import sys
 import json
+import urllib.request
 import asyncio
 import subprocess
 from datetime import datetime, date, timedelta
@@ -22,7 +23,6 @@ from dotenv import load_dotenv
 import pytz
 import pdfplumber
 from icalendar import Calendar, Event, vText
-from playwright.async_api import async_playwright
 
 # Charger la configuration
 BASE_DIR = Path(__file__).parent.resolve()
@@ -335,435 +335,91 @@ def parse_pdf_timetable(pdf_path: Path, week_num: int, year: int = None) -> list
     return events
 
 
-async def fetch_community_iut_events(context) -> list:
-    """Récupère les cours publiés sur Community IUT (Moodle GEA) en inspectant tous les dossiers disponibles."""
-    print(f"\n[*] --- Connexion à Community IUT (Moodle GEA) pour {TARGET_GROUP} ---")
-    page = context.pages[0] if context.pages else await context.new_page()
-    download_dir = BASE_DIR / "downloaded_edt"
-    download_dir.mkdir(exist_ok=True)
+
+def fetch_edtts_events(target_group: str) -> list:
+    '''Récupère les cours via la nouvelle URL mmi.unilim.fr (sans VPN).'''
+    import urllib.request
+    import json
     
+    print(f"[*] --- Récupération des événements EDTTS pour le groupe {target_group} ---")
+    manifest_url = "https://mmi.unilim.fr/edtts/pub/gea/manifest.json"
+    base_url = "https://mmi.unilim.fr/edtts/pub/gea/"
+    
+    try:
+        req = urllib.request.Request(manifest_url)
+        with urllib.request.urlopen(req) as response:
+            manifest = json.loads(response.read().decode())
+    except Exception as e:
+        print(f"[!] Erreur lors de la récupération du manifest : {e}")
+        return []
+        
+    target_id_normalized = target_group.upper().replace(" ", "-").replace("_", "-")
+    target_ics_url = None
+    for cal_entry in manifest.get("calendars", []):
+        if cal_entry.get("type") == "group" and cal_entry.get("id", "").upper() == target_id_normalized:
+            target_ics_url = base_url + cal_entry["file"]
+            break
+            
+    if not target_ics_url:
+        print(f"[!] Aucun calendrier trouvé pour le groupe {target_id_normalized}.")
+        return []
+        
+    print(f"[+] Téléchargement de l'ICS depuis : {target_ics_url}")
+    try:
+        req = urllib.request.Request(target_ics_url)
+        with urllib.request.urlopen(req) as response:
+            ics_content = response.read()
+    except Exception as e:
+        print(f"[!] Erreur lors du téléchargement de l'ICS : {e}")
+        return []
+        
     events = []
-    group_norm = re.sub(r'[^A-Z0-9]', '', TARGET_GROUP.upper()) # GEMA1TP2
-    
     try:
-        # 1. Authentification CAS pour Community IUT
-        await page.goto("https://community-iut.unilim.fr/login/index.php?authCAS=CAS", wait_until="networkidle")
-        await page.wait_for_timeout(2000)
-        
-        if "cas.unilim.fr" in page.url:
-            print("[*] Connexion CAS Unilim pour Community IUT...")
-            await page.fill('input[name="user"]', CAS_USERNAME)
-            await page.fill('input[name="password"]', CAS_PASSWORD)
-            stay = page.locator('input[name="stayconnected"]').first
-            if await stay.count() > 0:
-                await stay.check()
-            await page.click('button[type="submit"]')
-            await page.wait_for_load_state("networkidle")
-            await page.wait_for_timeout(3000)
+        import re
+        cal = Calendar.from_ical(ics_content)
+        for ev in cal.walk("VEVENT"):
+            raw_summary = str(ev.get("summary", ""))
+            raw_desc = str(ev.get("description", ""))
+            raw_loc = str(ev.get("location", ""))
             
-        # 2. Accès à la section EMPLOIS DU TEMPS
-        course_url = "https://community-iut.unilim.fr/course/view.php?id=1790&section=1#tabs-tree-start"
-        print(f"[*] Accès à {course_url}...")
-        await page.goto(course_url, wait_until="networkidle")
-        await page.wait_for_timeout(2000)
-        
-        # 3. Récupérer tous les dossiers de semaines (ex: 'Semaine 39', 'Semaine 40', 'Semaine 41', 'S42', etc.)
-        folders = await page.evaluate('''() => {
-            const links = Array.from(document.querySelectorAll('a[href*="mod/folder/view.php"]')).map(a => ({
-                title: a.innerText.trim(),
-                href: a.href
-            })).filter(f => {
-                const t = f.title.toLowerCase();
-                return f.href.includes('mod/folder') && (
-                    t.includes('semaine') || 
-                    t.includes('sem') || 
-                    /^s\d+/i.test(t) || 
-                    /\b\d{1,2}\b/.test(t) ||
-                    t.includes('dossier')
-                );
-            });
+            start_dt = ev.get("dtstart").dt
+            end_dt = ev.get("dtend").dt
+            if isinstance(start_dt, datetime):
+                start_dt = TZ.localize(start_dt) if start_dt.tzinfo is None else start_dt.astimezone(TZ)
+                start_dt = start_dt.replace(tzinfo=None)
+            if isinstance(end_dt, datetime):
+                end_dt = TZ.localize(end_dt) if end_dt.tzinfo is None else end_dt.astimezone(TZ)
+                end_dt = end_dt.replace(tzinfo=None)
+                
+            code_match = re.search(r'Code:\s*([^\n]+)', raw_desc)
+            raw_code = code_match.group(1).strip() if code_match else raw_summary.split(' ')[0]
             
-            const unique = [];
-            const seen = new Set();
-            for (const f of links) {
-                if (!seen.has(f.href)) {
-                    seen.add(f.href);
-                    unique.push(f);
-                }
-            }
-            return unique;
-        }''')
-        
-        # Extraire le numéro de semaine de chaque dossier
-        parsed_folders = []
-        for f in folders:
-            title = f['title'].splitlines()[0].strip()
-            num_match = re.search(r'(?:semaine|sem|s|\b)(\d{1,2})\b', title, re.I)
-            week_num = int(num_match.group(1)) if num_match else 0
-            parsed_folders.append({
+            teacher_match = re.search(r'Enseignant\(s\):\s*([^\n]+)', raw_desc)
+            teacher = teacher_match.group(1).strip() if teacher_match else ''
+            
+            group_match = re.search(r'Groupe\(s\):\s*([^\n]+)', raw_desc)
+            groups = group_match.group(1).strip() if group_match else ''
+            
+            course_type = get_event_category(raw_summary, raw_desc, f"{raw_code} {teacher}")
+            title = resolve_course_title(raw_code, course_type, teacher)
+            
+            location = f"Salle {raw_loc} - IUT Limoges" if raw_loc and not raw_loc.startswith("Salle") else (raw_loc or "IUT Limoges")
+            desc = f"Cours: {title}\nType: {course_type}\nEnseignant: {teacher}\nGroupes: {groups}\nLieu: {location}"
+            
+            events.append({
                 "title": title,
-                "href": f["href"],
-                "week_num": week_num
+                "start_dt": start_dt,
+                "end_dt": end_dt,
+                "location": location,
+                "description": desc,
+                "category": course_type,
+                "teacher": teacher
             })
-            
-        print(f"[+] Dossiers de semaines détectés sur Community IUT : {[f['title'] for f in parsed_folders]}")
-        
-        # Filtrer pour ne traiter que les semaines pertinentes (semaine courante et futures)
-        now = datetime.now()
-        current_iso_week = now.isocalendar()[1]
-        
-        # Traiter les dossiers disponibles à date
-        for f in parsed_folders:
-            folder_title = f["title"]
-            folder_url = f["href"]
-            week_num = f["week_num"] or current_iso_week
-            
-            # Si le dossier est trop ancien (ex: 2 semaines dans le passé), on peut le sauter
-            if week_num < current_iso_week - 1 and week_num > 0:
-                print(f"[*] Dossier {folder_title} ignoré (semaine passée).")
-                continue
-                
-            print(f"[*] Analyse de {folder_title} ({folder_url})...")
-            await page.goto(folder_url, wait_until="networkidle")
-            await page.wait_for_timeout(1500)
-            
-            files = await page.evaluate('''() => {
-                return Array.from(document.querySelectorAll('a')).map(a => ({
-                    text: a.innerText.trim(),
-                    href: a.href
-                })).filter(l => l.href.includes('pluginfile.php') || l.text.includes('.ics') || l.text.includes('.pdf'));
-            }''')
-            
-            # 1. Chercher un fichier ICS pour le groupe
-            target_ics = None
-            target_pdf = None
-            
-            for file_info in files:
-                fn_norm = re.sub(r'[^A-Z0-9]', '', file_info['text'].upper())
-                fn_href = file_info['href'].upper()
-                if group_norm in fn_norm or group_norm in re.sub(r'[^A-Z0-9]', '', fn_href):
-                    if '.ICS' in fn_norm or '.ICS' in fn_href:
-                        target_ics = file_info
-                    elif '.PDF' in fn_norm or '.PDF' in fn_href:
-                        target_pdf = file_info
-                        
-            # Si un ICS existe, on le privilégie
-            if target_ics:
-                print(f"    -> Téléchargement du fichier ICS : {target_ics['text']}...")
-                async with page.expect_download() as download_info:
-                    await page.locator(f'a:has-text("{target_ics["text"]}")').first.click()
-                download = await download_info.value
-                save_file = download_dir / f"{folder_title.replace(' ', '_')}_{download.suggested_filename}"
-                await download.save_as(save_file)
-                print(f"    [+] Fichier sauvegardé : {save_file}")
-                
-                with open(save_file, "rb") as fp:
-                    cal = Calendar.from_ical(fp.read())
-                    
-                for ev in cal.walk("VEVENT"):
-                    raw_summary = str(ev.get("summary", ""))
-                    raw_desc = str(ev.get("description", ""))
-                    raw_loc = str(ev.get("location", ""))
-                    
-                    start_dt = ev.get("dtstart").dt
-                    end_dt = ev.get("dtend").dt
-                    if isinstance(start_dt, datetime):
-                        start_dt = TZ.localize(start_dt) if start_dt.tzinfo is None else start_dt.astimezone(TZ)
-                        start_dt = start_dt.replace(tzinfo=None)
-                    if isinstance(end_dt, datetime):
-                        end_dt = TZ.localize(end_dt) if end_dt.tzinfo is None else end_dt.astimezone(TZ)
-                        end_dt = end_dt.replace(tzinfo=None)
-                        
-                    code_match = re.search(r'Code:\s*([^\n]+)', raw_desc)
-                    raw_code = code_match.group(1).strip() if code_match else raw_summary.split(' ')[0]
-                    
-                    teacher_match = re.search(r'Enseignant\(s\):\s*([^\n]+)', raw_desc)
-                    teacher = teacher_match.group(1).strip() if teacher_match else ''
-                    
-                    group_match = re.search(r'Groupe\(s\):\s*([^\n]+)', raw_desc)
-                    groups = group_match.group(1).strip() if group_match else ''
-                    
-                    course_type = get_event_category(raw_summary, raw_desc, f"{raw_code} {teacher}")
-                    title = resolve_course_title(raw_code, course_type, teacher)
-                    
-                    location = f"Salle {raw_loc} - IUT Limoges" if raw_loc and not raw_loc.startswith("Salle") else (raw_loc or "IUT Limoges")
-                    desc = f"Cours: {title}\nType: {course_type}\nEnseignant: {teacher}\nGroupes: {groups}\nLieu: {location}"
-                    
-                    events.append({
-                        "title": title,
-                        "start_dt": start_dt,
-                        "end_dt": end_dt,
-                        "location": location,
-                        "description": desc,
-                        "category": course_type,
-                        "teacher": teacher
-                    })
-            # Si seul le PDF est disponible (ex: Semaine 41)
-            elif target_pdf:
-                print(f"    -> Téléchargement du fichier PDF : {target_pdf['text']}...")
-                async with page.expect_download() as download_info:
-                    await page.locator(f'a:has-text("{target_pdf["text"]}")').first.click()
-                download = await download_info.value
-                save_file = download_dir / f"{folder_title.replace(' ', '_')}_{download.suggested_filename}"
-                await download.save_as(save_file)
-                print(f"    [+] Fichier sauvegardé : {save_file}")
-                
-                # Parsing géométrique du PDF
-                pdf_events = parse_pdf_timetable(save_file, week_num=week_num, year=now.year)
-                print(f"    [+] {len(pdf_events)} cours extraits du PDF pour {folder_title}")
-                events.extend(pdf_events)
-            else:
-                print(f"    [!] Aucun fichier ICS ou PDF trouvé pour {TARGET_GROUP} dans {folder_title}")
-                
     except Exception as e:
-        print(f"[!] Erreur lors de la récupération Community IUT : {e}")
+        print(f"[!] Erreur lors du parsing de l'ICS : {e}")
         
-    print(f"[+] Total cours extraits depuis Community IUT : {len(events)}")
+    print(f"[+] {len(events)} cours récupérés depuis EDTTS.")
     return events
-
-
-async def scrape_ade_campus_events(context, num_weeks: int = 3) -> list:
-    """Récupère l'emploi du temps depuis ADE Campus via Playwright."""
-    print(f"\n[*] --- Consultation ADE Campus (planning.unilim.fr) ---")
-    page = context.pages[0] if context.pages else await context.new_page()
-    all_extracted_events = []
-    
-    try:
-        await page.goto("https://planning.unilim.fr/direct/myplanning.jsp", wait_until="networkidle")
-        await page.wait_for_timeout(2000)
-        
-        if "cas.unilim.fr" in page.url:
-            print("[*] Authentification CAS Unilim (ADE Campus)...")
-            await page.fill('input[name="user"]', CAS_USERNAME)
-            await page.fill('input[name="password"]', CAS_PASSWORD)
-            stay = page.locator('input[name="stayconnected"]').first
-            if await stay.count() > 0:
-                await stay.check()
-            await page.click('button[type="submit"]')
-            await page.wait_for_load_state("networkidle")
-            await page.wait_for_timeout(3000)
-            
-        async def click_node(name):
-            loc = page.get_by_text(name, exact=False).first
-            await loc.scroll_into_view_if_needed()
-            await loc.dblclick()
-            await page.wait_for_timeout(1500)
-            
-        print("[*] Navigation vers Semestre 3 GEA GEMA...")
-        await click_node("Groupes Etudiants")
-        await click_node("I. U. T. du Limousin")
-        await click_node("BACHELOR UNIVERSITAIRE DE TECHNOLOGIE")
-        
-        tree_scroller = page.locator(".x-grid3-scroller").first
-        await tree_scroller.evaluate("el => el.scrollTop = 350")
-        await page.wait_for_timeout(1000)
-        
-        await click_node("BUT 2 - GEA LIMOGES - GEMA")
-        await page.wait_for_timeout(1000)
-        await click_node("Semestre 3")
-        await page.wait_for_timeout(3000)
-        
-        now = datetime.now()
-        current_iso_week = now.isocalendar()[1]
-        target_week_codes = [f"S{current_iso_week + i}" for i in range(num_weeks)]
-        
-        for week_idx, w_code in enumerate(target_week_codes):
-            target_btn = page.locator('.x-btn-text').filter(has_text=re.compile(rf'^{w_code}\b')).first
-            if await target_btn.count() > 0:
-                await target_btn.click()
-                await page.wait_for_timeout(2000)
-            else:
-                alt_btn = page.locator('.x-btn-text').filter(has_text=w_code).first
-                if await alt_btn.count() > 0:
-                    await alt_btn.click()
-                    await page.wait_for_timeout(2000)
-            
-            cards = await page.evaluate('''() => {
-                const dayHeaders = Array.from(document.querySelectorAll('div, td, span')).filter(e => {
-                    const t = e.innerText || '';
-                    return (t.startsWith('Lundi ') || t.startsWith('Mardi ') || t.startsWith('Mercredi ') || t.startsWith('Jeudi ') || t.startsWith('Vendredi ')) && t.includes('/');
-                });
-                
-                const days = dayHeaders.map(dh => {
-                    const rect = dh.getBoundingClientRect();
-                    return { text: dh.innerText.trim(), left: rect.left, right: rect.right };
-                });
-                
-                const allDivs = Array.from(document.querySelectorAll('div'));
-                const matches = [];
-                for (const d of allDivs) {
-                    const t = d.innerText || '';
-                    const rect = d.getBoundingClientRect();
-                    if (rect.left > 200 && rect.width > 50 && rect.height > 25 && t.includes('h') && (t.includes('CM') || t.includes('TD') || t.includes('TP') || t.includes('AUTONOMIE') || t.includes('SAE') || t.includes('R3.') || t.includes('Réunion') || t.includes('REUNION') || t.includes('Contrôle') || t.includes('Evaluation') || t.includes('DS'))) {
-                        const hasMatchingChild = Array.from(d.querySelectorAll('div')).some(child => {
-                            const ct = child.innerText || '';
-                            return ct.includes('h') && (ct.includes('CM') || ct.includes('TD') || ct.includes('TP') || ct.includes('AUTONOMIE') || ct.includes('SAE') || ct.includes('R3.'));
-                        });
-                        if (!hasMatchingChild) {
-                            const cx = (rect.left + rect.right) / 2;
-                            const day = days.find(dayObj => cx >= dayObj.left && cx <= dayObj.right);
-                            const bg = window.getComputedStyle(d).backgroundColor || '';
-                            const isYellow = bg.includes('255, 255') || bg.includes('255, 235') || bg.includes('255, 240') || bg.includes('yellow');
-                            matches.push({
-                                text: t.trim(),
-                                day: day ? day.text : null,
-                                isYellow: isYellow
-                            });
-                        }
-                    }
-                }
-                return matches;
-            }''')
-            
-            for card in cards:
-                if not card["day"]:
-                    continue
-                lines = [l.strip() for l in card["text"].split("\n") if l.strip()]
-                if not lines:
-                    continue
-                    
-                date_match = re.search(r'(\d{2})/(\d{2})/(\d{4})', card["day"])
-                if not date_match:
-                    continue
-                day_val, month_val, year_val = map(int, date_match.groups())
-                
-                time_line_idx = -1
-                start_h, start_m, end_h, end_m = 8, 0, 10, 0
-                for idx, line in enumerate(lines):
-                    tm = re.search(r'(\d{1,2})h(\d{2})\s*-\s*(\d{1,2})h(\d{2})', line)
-                    if tm:
-                        start_h, start_m, end_h, end_m = map(int, tm.groups())
-                        time_line_idx = idx
-                        break
-                        
-                if time_line_idx == -1:
-                    continue
-                    
-                start_dt = datetime(year_val, month_val, day_val, start_h, start_m)
-                end_dt = datetime(year_val, month_val, day_val, end_h, end_m)
-                title = lines[0]
-                
-                location = "IUT Limoges"
-                teacher = ""
-                groups = []
-                
-                for idx, line in enumerate(lines[1:], 1):
-                    if idx == time_line_idx:
-                        continue
-                    if re.match(r'^(Amphi\s+[A-Z0-9]+|\d{3}|R\.\d{2}|R\d{2})$', line, re.I):
-                        location = f"Salle {line} - IUT Limoges"
-                    elif any(g in line for g in ["CM", "TD", "TP", "GEMA"]):
-                        groups.append(line)
-                    elif not any(char.isdigit() for char in line) and len(line) > 3:
-                        teacher = line
-                        
-                description = f"Cours: {title}\nGroupes: {', '.join(set(groups))}\nEnseignant: {teacher}\nLieu: {location}"
-                
-                my_td = "GEMA1" if "GEMA1" in TARGET_GROUP else "GEMA2"
-                my_tp = "TP2" if "TP2" in TARGET_GROUP else "TP1"
-                group_lines = [l for l in lines if any(k in l for k in ["CM", "TD", "TP", "GEMA"])]
-                
-                if group_lines and all(l.startswith("CM") for l in group_lines):
-                    is_for_user = True
-                else:
-                    has_my_td = any(f"TD {my_td}" in l for l in lines)
-                    has_other_td = any(bool(re.search(r'TD\s+GEMA[234]', l)) if my_td == "GEMA1" else bool(re.search(r'TD\s+GEMA1', l)) for l in lines)
-                    has_my_tp = any(f"{my_tp}" in l for l in lines)
-                    has_other_tp = any(("TP1" in l if my_tp == "TP2" else "TP2" in l) for l in lines)
-                    
-                    is_for_user = True
-                    if has_other_td and not has_my_td:
-                        is_for_user = False
-                    elif any("TP" in l for l in lines) and has_other_tp and not has_my_tp:
-                        is_for_user = False
-                    
-                if is_for_user:
-                    cat = get_event_category(title, description, card["text"], is_yellow=card.get("isYellow", False))
-                    resolved_title = resolve_course_title(title, cat, teacher)
-                    all_extracted_events.append({
-                        "title": resolved_title,
-                        "start_dt": start_dt,
-                        "end_dt": end_dt,
-                        "location": location,
-                        "description": description,
-                        "category": cat,
-                        "teacher": teacher
-                    })
-    except Exception as e:
-        print(f"[!] Info ADE Campus : {e}")
-        
-    print(f"[+] Total cours extraits depuis ADE Campus : {len(all_extracted_events)}")
-    return all_extracted_events
-
-
-def merge_events_with_priority(community_events: list, ade_events: list) -> list:
-    """
-    Fusionne les événements en donnant la priorité absolue aux fichiers de Community IUT.
-    Si un créneau horaire chevauche un cours des fichiers, le cours ADE est automatiquement ignoré.
-    """
-    print(f"\n[*] --- Fusion intelligente avec priorité aux fichiers de Community IUT ---")
-    print(f"    -> Cours issus des fichiers (Community IUT) : {len(community_events)}")
-    print(f"    -> Cours issus d'ADE Campus : {len(ade_events)}")
-    
-    final_events = list(community_events)
-    ignored_ade_count = 0
-    added_ade_count = 0
-    
-    for ade_ev in ade_events:
-        ade_start = ade_ev["start_dt"]
-        ade_end = ade_ev["end_dt"]
-        
-        # 1. Vérifier si un cours Community IUT chevauche ce créneau horaire
-        conflict = False
-        for com_ev in community_events:
-            com_start = com_ev["start_dt"]
-            com_end = com_ev["end_dt"]
-            
-            # Chevauchement temporel : (StartA < EndB) et (EndA > StartB)
-            if (ade_start < com_end) and (ade_end > com_start):
-                conflict = True
-                ignored_ade_count += 1
-                break
-                
-        if not conflict:
-            if not any(e["title"] == ade_ev["title"] and e["start_dt"] == ade_ev["start_dt"] for e in final_events):
-                final_events.append(ade_ev)
-                added_ade_count += 1
-                
-    final_events.sort(key=lambda x: x["start_dt"])
-    print(f"[+] Résultat de la fusion : {len(final_events)} cours retenus ({len(community_events)} fichiers + {added_ade_count} ADE uniques, {ignored_ade_count} doublons ADE ignorés)")
-    return final_events
-
-
-async def scrape_all_sources() -> list:
-    """Récupère l'emploi du temps depuis Community IUT et ADE Campus, avec priorité absolue aux fichiers."""
-    profile_dir = BASE_DIR / ".browser_profile"
-    profile_dir.mkdir(exist_ok=True)
-    auth_file = BASE_DIR / "auth_state.json"
-    
-    community_events = []
-    ade_events = []
-    
-    async with async_playwright() as p:
-        context = await p.chromium.launch_persistent_context(
-            user_data_dir=str(profile_dir),
-            headless=True,
-            viewport={"width": 1400, "height": 900}
-        )
-        
-        # 1. Récupération prioritaire sur Community IUT (fichiers hebdomadaires ICS et PDF)
-        community_events = await fetch_community_iut_events(context)
-        
-        # 2. Récupération complémentaire sur ADE Campus (fallback si besoin)
-        ade_events = await scrape_ade_campus_events(context, num_weeks=3)
-        
-        # Sauvegarder la session active
-        await context.storage_state(path=str(auth_file))
-        await context.close()
-        
-    # Fusion avec priorité aux fichiers de Community IUT
-    return merge_events_with_priority(community_events, ade_events)
-
 
 def generate_ics_file(events: list, output_path: Path) -> None:
     """Génère un fichier standard .ics (iCalendar RFC 5545)."""
@@ -826,7 +482,7 @@ def sync():
     print("=" * 60)
     
     # 1. Récupérer les événements depuis toutes les sources (Community IUT + ADE Campus)
-    events = asyncio.run(scrape_all_sources())
+    events = fetch_edtts_events(TARGET_GROUP)
     
     if not events:
         print("[!] Aucun événement récupéré. Vérifiez les identifiants ou l'accès réseau.")
