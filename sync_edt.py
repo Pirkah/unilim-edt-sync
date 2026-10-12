@@ -233,7 +233,7 @@ def insert_events_by_category(events: list, chunk_size: int = 20) -> int:
             for ev in chunk:
                 summary = ev["title"].replace('"', '\\"')
                 location = ev["location"].replace('"', '\\"')
-                description = ev["description"].replace('"', '\\"').replace('\n', ' ')
+                description = ev["description"].replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n')
                 start_str = ev["start_dt"].strftime("%d/%m/%Y %H:%M:%S")
                 end_str = ev["end_dt"].strftime("%d/%m/%Y %H:%M:%S")
                 lines.append(f'make new event with properties {{summary:"{summary}", start date:date "{start_str}", end date:date "{end_str}", location:"{location}", description:"{description}"}}')
@@ -254,7 +254,7 @@ def insert_events_by_category(events: list, chunk_size: int = 20) -> int:
     return total_success
 
 
-def parse_pdf_timetable(pdf_path: Path, week_num: int, year: int = None) -> list:
+def parse_pdf_timetable(pdf_path: Path, week_num: int, year: int = None, source_name: str = "Community IUT (PDF)") -> list:
     """Extrait les cours directement depuis la grille PDF hebdomadaire de l'IUT."""
     if year is None:
         year = datetime.now().year
@@ -321,7 +321,8 @@ def parse_pdf_timetable(pdf_path: Path, week_num: int, year: int = None) -> list
                     
             cat = get_event_category(raw_code_line, text, raw_code_line)
             title = resolve_course_title(raw_code_line, cat, teacher)
-            desc = f"Cours: {title}\nType: {cat}\nEnseignant: {teacher}\nGroupes: {', '.join(set(groups))}\nLieu: {location}"
+            source_tag = f"📄 {source_name}"
+            desc = f"Source : {source_tag}\nCours : {title}\nType : {cat}\nEnseignant : {teacher}\nGroupes : {', '.join(set(groups))}\nLieu : {location}"
             
             events.append({
                 "title": title,
@@ -330,7 +331,8 @@ def parse_pdf_timetable(pdf_path: Path, week_num: int, year: int = None) -> list
                 "location": location,
                 "description": desc,
                 "category": cat,
-                "teacher": teacher
+                "teacher": teacher,
+                "source": source_tag
             })
             
     return events
@@ -369,6 +371,12 @@ def load_edtts_cache() -> list:
             ev["start_dt"] = datetime.fromisoformat(item["start_dt"])
             ev["end_dt"] = datetime.fromisoformat(item["end_dt"])
             if ev["end_dt"] >= today_start:
+                source_tag = "💾 Mémoire locale (Cache EDTTS)"
+                ev["source"] = source_tag
+                if ev.get("description", "").startswith("Source :"):
+                    ev["description"] = re.sub(r"^Source\s*:[^\n]+", f"Source : {source_tag}", ev["description"])
+                else:
+                    ev["description"] = f"Source : {source_tag}\n" + ev.get("description", "")
                 cached_events.append(ev)
         print(f"    [💾] Restauration depuis le cache local EDTTS : {len(cached_events)} cours futurs préservés !")
         return cached_events
@@ -433,9 +441,10 @@ def fetch_edtts_events(target_group: str) -> list:
                 
                 course_type = get_event_category(raw_summary, raw_desc, f"{raw_code} {teacher}")
                 title = resolve_course_title(raw_code, course_type, teacher)
+                source_tag = "🌐 EDTTS (mmi.unilim.fr)"
                 
                 location = f"Salle {raw_loc} - IUT Limoges" if raw_loc and not raw_loc.startswith("Salle") else (raw_loc or "IUT Limoges")
-                desc = f"Cours: {title}\nType: {course_type}\nEnseignant: {teacher}\nGroupes: {groups}\nLieu: {location}"
+                desc = f"Source : {source_tag}\nCours : {title}\nType : {course_type}\nEnseignant : {teacher}\nGroupes : {groups}\nLieu : {location}"
                 
                 live_events.append({
                     "title": title,
@@ -444,7 +453,8 @@ def fetch_edtts_events(target_group: str) -> list:
                     "location": location,
                     "description": desc,
                     "category": course_type,
-                    "teacher": teacher
+                    "teacher": teacher,
+                    "source": source_tag
                 })
             fetch_success = True
     except Exception as e:
@@ -620,9 +630,10 @@ async def fetch_community_iut_events(context) -> list:
                     
                     course_type = get_event_category(raw_summary, raw_desc, f"{raw_code} {teacher}")
                     title = resolve_course_title(raw_code, course_type, teacher)
+                    source_tag = f"📁 Community IUT ({folder_title} - ICS)"
                     
                     location = f"Salle {raw_loc} - IUT Limoges" if raw_loc and not raw_loc.startswith("Salle") else (raw_loc or "IUT Limoges")
-                    desc = f"Cours: {title}\nType: {course_type}\nEnseignant: {teacher}\nGroupes: {groups}\nLieu: {location}"
+                    desc = f"Source : {source_tag}\nCours : {title}\nType : {course_type}\nEnseignant : {teacher}\nGroupes : {groups}\nLieu : {location}"
                     
                     events.append({
                         "title": title,
@@ -631,7 +642,8 @@ async def fetch_community_iut_events(context) -> list:
                         "location": location,
                         "description": desc,
                         "category": course_type,
-                        "teacher": teacher
+                        "teacher": teacher,
+                        "source": source_tag
                     })
             # Si seul le PDF est disponible (ex: Semaine 41)
             elif target_pdf:
@@ -644,7 +656,7 @@ async def fetch_community_iut_events(context) -> list:
                 print(f"    [+] Fichier sauvegardé : {save_file}")
                 
                 # Parsing géométrique du PDF
-                pdf_events = parse_pdf_timetable(save_file, week_num=week_num, year=now.year)
+                pdf_events = parse_pdf_timetable(save_file, week_num=week_num, year=now.year, source_name=f"Community IUT ({folder_title} - PDF)")
                 print(f"    [+] {len(pdf_events)} cours extraits du PDF pour {folder_title}")
                 events.extend(pdf_events)
             else:
@@ -803,7 +815,8 @@ async def scrape_ade_campus_events(context, num_weeks: int = 3) -> list:
                     elif not any(char.isdigit() for char in line) and len(line) > 3:
                         teacher = line
                         
-                description = f"Cours: {title}\nGroupes: {', '.join(set(groups))}\nEnseignant: {teacher}\nLieu: {location}"
+                source_tag = "🏛️ ADE Campus (planning.unilim.fr)"
+                description = f"Source : {source_tag}\nCours : {title}\nGroupes: {', '.join(set(groups))}\nEnseignant: {teacher}\nLieu: {location}"
                 
                 my_td = "GEMA1" if "GEMA1" in TARGET_GROUP else "GEMA2"
                 my_tp = "TP2" if "TP2" in TARGET_GROUP else "TP1"
@@ -833,7 +846,8 @@ async def scrape_ade_campus_events(context, num_weeks: int = 3) -> list:
                         "location": location,
                         "description": description,
                         "category": cat,
-                        "teacher": teacher
+                        "teacher": teacher,
+                        "source": source_tag
                     })
     except Exception as e:
         print(f"[!] Info ADE Campus : {e}")
@@ -1001,6 +1015,14 @@ def sync():
     
     # 4. Injecter les événements futurs / en cours dans les 4 calendriers iCloud
     future_events = [e for e in events if e["end_dt"] >= today_start]
+    
+    source_stats = {}
+    for e in future_events:
+        s = e.get("source", "Source inconnue")
+        source_stats[s] = source_stats.get(s, 0) + 1
+    print("[*] Origine des cours prêts à être injectés :")
+    for s, count in sorted(source_stats.items()):
+        print(f"    -> {s} : {count} cours")
     success_count = insert_events_by_category(future_events, chunk_size=20)
     print(f"✅ SYNCHRONISATION RÉUSSIE : {success_count}/{len(future_events)} cours futurs injectés dans CM, TD, TP, Contrôles (anciens cours conservés) !")
     
