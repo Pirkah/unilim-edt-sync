@@ -51,5 +51,7 @@ wheels/
 temp/
 logs/
 downloaded_edt/
+cache_edtts.json
 *.log
+
 

@@ -337,8 +337,48 @@ def parse_pdf_timetable(pdf_path: Path, week_num: int, year: int = None) -> list
 
 
 
+def save_edtts_cache(events: list) -> None:
+    """Sauvegarde les événements EDTTS dans un fichier de cache JSON persistant."""
+    cache_path = BASE_DIR / "cache_edtts.json"
+    try:
+        serializable = []
+        for ev in events:
+            item = dict(ev)
+            item["start_dt"] = ev["start_dt"].isoformat()
+            item["end_dt"] = ev["end_dt"].isoformat()
+            serializable.append(item)
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(serializable, f, ensure_ascii=False, indent=2)
+        print(f"    [💾] Mémoire locale EDTTS mise à jour ({len(serializable)} cours enregistrés dans cache_edtts.json)")
+    except Exception as e:
+        print(f"    [!] Erreur sauvegarde cache EDTTS : {e}")
+
+
+def load_edtts_cache() -> list:
+    """Charge les événements futurs conservés dans le cache JSON persistant."""
+    cache_path = BASE_DIR / "cache_edtts.json"
+    if not cache_path.exists():
+        return []
+    try:
+        with open(cache_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        cached_events = []
+        today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        for item in data:
+            ev = dict(item)
+            ev["start_dt"] = datetime.fromisoformat(item["start_dt"])
+            ev["end_dt"] = datetime.fromisoformat(item["end_dt"])
+            if ev["end_dt"] >= today_start:
+                cached_events.append(ev)
+        print(f"    [💾] Restauration depuis le cache local EDTTS : {len(cached_events)} cours futurs préservés !")
+        return cached_events
+    except Exception as e:
+        print(f"    [!] Erreur lecture cache EDTTS : {e}")
+        return []
+
+
 def fetch_edtts_events(target_group: str) -> list:
-    '''Récupère les cours via la nouvelle URL mmi.unilim.fr (sans VPN).'''
+    """Récupère les cours via EDTTS (mmi.unilim.fr) avec sauvegarde et conservation des semaines futures en cache."""
     import urllib.request
     import json
     
@@ -346,82 +386,89 @@ def fetch_edtts_events(target_group: str) -> list:
     manifest_url = "https://mmi.unilim.fr/edtts/pub/gea/manifest.json"
     base_url = "https://mmi.unilim.fr/edtts/pub/gea/"
     
+    live_events = []
+    fetch_success = False
+    
     try:
-        req = urllib.request.Request(manifest_url)
-        with urllib.request.urlopen(req) as response:
+        req = urllib.request.Request(manifest_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=8) as response:
             manifest = json.loads(response.read().decode())
-    except Exception as e:
-        print(f"[!] Erreur lors de la récupération du manifest : {e}")
-        return []
-        
-    target_id_normalized = target_group.upper().replace(" ", "-").replace("_", "-")
-    target_ics_url = None
-    for cal_entry in manifest.get("calendars", []):
-        if cal_entry.get("type") == "group" and cal_entry.get("id", "").upper() == target_id_normalized:
-            target_ics_url = base_url + cal_entry["file"]
-            break
             
-    if not target_ics_url:
-        print(f"[!] Aucun calendrier trouvé pour le groupe {target_id_normalized}.")
-        return []
-        
-    print(f"    -> Téléchargement de l'ICS depuis : {target_ics_url}")
-    try:
-        req = urllib.request.Request(target_ics_url)
-        with urllib.request.urlopen(req) as response:
-            ics_content = response.read()
-    except Exception as e:
-        print(f"[!] Erreur lors du téléchargement de l'ICS : {e}")
-        return []
-        
-    events = []
-    try:
-        cal = Calendar.from_ical(ics_content)
-        for ev in cal.walk("VEVENT"):
-            raw_summary = str(ev.get("summary", ""))
-            raw_desc = str(ev.get("description", ""))
-            raw_loc = str(ev.get("location", ""))
-            
-            start_dt = ev.get("dtstart").dt
-            end_dt = ev.get("dtend").dt
-            if isinstance(start_dt, datetime):
-                start_dt = TZ.localize(start_dt) if start_dt.tzinfo is None else start_dt.astimezone(TZ)
-                start_dt = start_dt.replace(tzinfo=None)
-            if isinstance(end_dt, datetime):
-                end_dt = TZ.localize(end_dt) if end_dt.tzinfo is None else end_dt.astimezone(TZ)
-                end_dt = end_dt.replace(tzinfo=None)
+        target_id_normalized = target_group.upper().replace(" ", "-").replace("_", "-")
+        target_ics_url = None
+        for cal_entry in manifest.get("calendars", []):
+            if cal_entry.get("type") == "group" and cal_entry.get("id", "").upper() == target_id_normalized:
+                target_ics_url = base_url + cal_entry["file"]
+                break
                 
-            code_match = re.search(r'Code:\s*([^\n]+)', raw_desc)
-            raw_code = code_match.group(1).strip() if code_match else raw_summary.split(' ')[0]
-            
-            teacher_match = re.search(r'Enseignant\(s\):\s*([^\n]+)', raw_desc)
-            teacher = teacher_match.group(1).strip() if teacher_match else ''
-            
-            group_match = re.search(r'Groupe\(s\):\s*([^\n]+)', raw_desc)
-            groups = group_match.group(1).strip() if group_match else ''
-            
-            course_type = get_event_category(raw_summary, raw_desc, f"{raw_code} {teacher}")
-            title = resolve_course_title(raw_code, course_type, teacher)
-            
-            location = f"Salle {raw_loc} - IUT Limoges" if raw_loc and not raw_loc.startswith("Salle") else (raw_loc or "IUT Limoges")
-            desc = f"Cours: {title}\nType: {course_type}\nEnseignant: {teacher}\nGroupes: {groups}\nLieu: {location}"
-            
-            events.append({
-                "title": title,
-                "start_dt": start_dt,
-                "end_dt": end_dt,
-                "location": location,
-                "description": desc,
-                "category": course_type,
-                "teacher": teacher
-            })
+        if target_ics_url:
+            print(f"    -> Téléchargement de l'ICS depuis : {target_ics_url}")
+            req_ics = urllib.request.Request(target_ics_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req_ics, timeout=8) as response:
+                ics_content = response.read()
+                
+            cal = Calendar.from_ical(ics_content)
+            for ev in cal.walk("VEVENT"):
+                raw_summary = str(ev.get("summary", ""))
+                raw_desc = str(ev.get("description", ""))
+                raw_loc = str(ev.get("location", ""))
+                
+                start_dt = ev.get("dtstart").dt
+                end_dt = ev.get("dtend").dt
+                if isinstance(start_dt, datetime):
+                    start_dt = TZ.localize(start_dt) if start_dt.tzinfo is None else start_dt.astimezone(TZ)
+                    start_dt = start_dt.replace(tzinfo=None)
+                if isinstance(end_dt, datetime):
+                    end_dt = TZ.localize(end_dt) if end_dt.tzinfo is None else end_dt.astimezone(TZ)
+                    end_dt = end_dt.replace(tzinfo=None)
+                    
+                code_match = re.search(r'Code:\s*([^\n]+)', raw_desc)
+                raw_code = code_match.group(1).strip() if code_match else raw_summary.split(' ')[0]
+                
+                teacher_match = re.search(r'Enseignant\(s\):\s*([^\n]+)', raw_desc)
+                teacher = teacher_match.group(1).strip() if teacher_match else ''
+                
+                group_match = re.search(r'Groupe\(s\):\s*([^\n]+)', raw_desc)
+                groups = group_match.group(1).strip() if group_match else ''
+                
+                course_type = get_event_category(raw_summary, raw_desc, f"{raw_code} {teacher}")
+                title = resolve_course_title(raw_code, course_type, teacher)
+                
+                location = f"Salle {raw_loc} - IUT Limoges" if raw_loc and not raw_loc.startswith("Salle") else (raw_loc or "IUT Limoges")
+                desc = f"Cours: {title}\nType: {course_type}\nEnseignant: {teacher}\nGroupes: {groups}\nLieu: {location}"
+                
+                live_events.append({
+                    "title": title,
+                    "start_dt": start_dt,
+                    "end_dt": end_dt,
+                    "location": location,
+                    "description": desc,
+                    "category": course_type,
+                    "teacher": teacher
+                })
+            fetch_success = True
     except Exception as e:
-        print(f"[!] Erreur lors du parsing de l'ICS : {e}")
-        
-    print(f"[+] {len(events)} cours récupérés depuis EDTTS.")
-    return events
+        print(f"[!] Accès direct EDTTS impossible ({e}) - Probablement hors réseau IUT / 5G.")
 
-
+    cached_events = load_edtts_cache()
+    
+    if fetch_success and live_events:
+        print(f"[+] {len(live_events)} cours récupérés en direct depuis EDTTS.")
+        # Conserver les cours futurs du cache qui ne seraient pas dans cette extraction
+        merged_edtts = list(live_events)
+        for ce in cached_events:
+            if not any((ce["start_dt"] < le["end_dt"] and ce["end_dt"] > le["start_dt"]) for le in live_events):
+                merged_edtts.append(ce)
+        merged_edtts.sort(key=lambda x: x["start_dt"])
+        save_edtts_cache(merged_edtts)
+        return merged_edtts
+    else:
+        if cached_events:
+            print(f"[+] Utilisation des {len(cached_events)} cours EDTTS conservés en mémoire locale (semaines futures sauvées).")
+            return cached_events
+        else:
+            print("[!] Aucun cours EDTTS en direct ni en mémoire locale.")
+            return []
 
 async def fetch_community_iut_events(context) -> list:
     """Récupère les cours publiés sur Community IUT (Moodle GEA) en inspectant tous les dossiers disponibles."""
@@ -639,7 +686,7 @@ async def scrape_ade_campus_events(context, num_weeks: int = 3) -> list:
                     return
                     
             loc = page.get_by_text(name, exact=False).first
-            await loc.scroll_into_view_if_needed()
+            await loc.scroll_into_view_if_needed(timeout=4000)
             await loc.dblclick()
             await page.wait_for_timeout(1500)
             

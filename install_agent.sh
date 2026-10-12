@@ -22,20 +22,26 @@ mkdir -p "$LAUNCH_AGENTS_DIR"
 cp "$PROJECT_DIR/sync_edt.py" "$TARGET_DIR/"
 cp "$PROJECT_DIR/.env" "$TARGET_DIR/" 2>/dev/null || true
 cp "$PROJECT_DIR/auth_state.json" "$TARGET_DIR/" 2>/dev/null || true
+cp "$PROJECT_DIR/cache_edtts.json" "$TARGET_DIR/" 2>/dev/null || true
 
 # 3. Créer un script wrapper bash pour une exécution propre
 cat <<EOF > "$TARGET_DIR/run_sync.sh"
 #!/bin/bash
 export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/Library/Python/3.9/bin:$HOME/Library/Python/3.10/bin:$HOME/Library/Python/3.11/bin:$HOME/Library/Python/3.12/bin:\$PATH"
 cd "$TARGET_DIR"
+
+# Récupérer la dernière version du cache local si présent sur le bureau
+cp "$PROJECT_DIR/cache_edtts.json" "$TARGET_DIR/cache_edtts.json" 2>/dev/null || true
+
 $PYTHON_EXEC sync_edt.py >> "$TARGET_DIR/logs/sync_stdout.log" 2>> "$TARGET_DIR/logs/sync_stderr.log"
 
-# Recopier la session mise à jour vers le projet du Bureau si besoin
+# Recopier la session et le cache mis à jour vers le projet du Bureau
 cp "$TARGET_DIR/auth_state.json" "$PROJECT_DIR/auth_state.json" 2>/dev/null || true
+cp "$TARGET_DIR/cache_edtts.json" "$PROJECT_DIR/cache_edtts.json" 2>/dev/null || true
 EOF
 chmod +x "$TARGET_DIR/run_sync.sh"
 
-# 4. Génération du fichier plist pour launchd
+# 4. Génération du fichier plist pour launchd (toutes les 30 min + checkpoints réguliers)
 cat <<EOF > "$LAUNCH_AGENTS_DIR/$PLIST_NAME"
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -50,20 +56,18 @@ cat <<EOF > "$LAUNCH_AGENTS_DIR/$PLIST_NAME"
     </array>
     <key>WorkingDirectory</key>
     <string>$TARGET_DIR</string>
+    <key>StartInterval</key>
+    <integer>1800</integer>
     <key>StartCalendarInterval</key>
     <array>
-        <dict>
-            <key>Hour</key>
-            <integer>6</integer>
-            <key>Minute</key>
-            <integer>30</integer>
-        </dict>
-        <dict>
-            <key>Hour</key>
-            <integer>19</integer>
-            <key>Minute</key>
-            <integer>30</integer>
-        </dict>
+        <dict><key>Hour</key><integer>7</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>8</integer><key>Minute</key><integer>30</integer></dict>
+        <dict><key>Hour</key><integer>10</integer><key>Minute</key><integer>30</integer></dict>
+        <dict><key>Hour</key><integer>12</integer><key>Minute</key><integer>30</integer></dict>
+        <dict><key>Hour</key><integer>14</integer><key>Minute</key><integer>30</integer></dict>
+        <dict><key>Hour</key><integer>16</integer><key>Minute</key><integer>30</integer></dict>
+        <dict><key>Hour</key><integer>18</integer><key>Minute</key><integer>30</integer></dict>
+        <dict><key>Hour</key><integer>20</integer><key>Minute</key><integer>30</integer></dict>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -80,4 +84,4 @@ launchctl unload "$LAUNCH_AGENTS_DIR/$PLIST_NAME" 2>/dev/null
 launchctl load "$LAUNCH_AGENTS_DIR/$PLIST_NAME"
 
 echo "✅ LaunchAgent installé et activé avec succès !"
-echo "La synchronisation se lancera automatiquement chaque matin (06h30) et chaque soir (19h30)."
+echo "La synchronisation se lancera automatiquement toutes les 30 minutes et à chaque ouverture/connexion."
